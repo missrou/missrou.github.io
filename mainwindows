@@ -1,0 +1,3285 @@
+import os
+import re
+import sqlite3
+import stat
+import sys
+import tempfile
+import webbrowser
+import xml.etree.ElementTree as ET
+import zipfile
+import numpy
+import numpy as np
+import openpyxl
+import subprocess
+import pandas as pd
+# pip install pyqtdarktheme
+import qdarktheme
+import requests
+# pip install pywin32
+import win32file as w
+from PyQt6 import QtWidgets
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, QSettings, QByteArray, QModelIndex
+from PyQt6.QtGui import QIcon, QCursor, QFont, QColor, QUndoStack, QUndoCommand, QAction, QKeySequence, QPainter, QStandardItemModel, QStandardItem, QFontMetrics
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import (QTableWidgetItem, QListWidgetItem, QLineEdit, QApplication, QMenu, QListWidget,
+                             QMessageBox, QInputDialog, QTableWidgetSelectionRange, QMainWindow, QTableWidget,
+                             QWidget, QSizePolicy, QHBoxLayout, QTabWidget, QVBoxLayout, QLabel, QFrame, QSplitter,
+                             QLayout, QComboBox, QCheckBox, QRadioButton, QSpacerItem, QScrollBar,
+                             QPlainTextEdit, QPushButton, QFontComboBox, QSpinBox, QGroupBox, QStatusBar, QFileDialog, QTreeView
+                             )
+from openpyxl.styles import Border, Side
+
+'''
+pyinstaller --noconfirm 清单查询.spec
+'''
+
+# 自定义标签，可以双击
+class DoubleClickLabel(QLabel):
+    doubleClicked = pyqtSignal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+# 自定义组合框,增加选择框
+class CustomComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super(CustomComboBox, self).__init__(parent)
+        self.setLineEdit(QLineEdit())
+        self.view().clicked.connect(self.selectItemAction)
+        self.font_metrics = QFontMetrics(self.font())
+
+    def addCheckableItem(self, text):
+        super().addItem(text)
+        item = self.model().item(self.count() - 1, 0)
+        item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        item.setCheckState(Qt.CheckState.Unchecked)
+
+    def addItems(self, texts):
+        for text in texts:
+            self.addCheckableItem(text)
+
+    def showPopup(self):
+        self.adjustListWidth()
+        super().showPopup()
+
+    def adjustListWidth(self):
+        max_width = 0
+        for i in range(self.model().rowCount()):
+            width = self.font_metrics.horizontalAdvance(self.itemText(i))
+            if width > max_width:
+                max_width = width
+        self.view().setMinimumWidth(max_width + 60)  # 添加一些额外空间
+
+    def ifChecked(self, index):
+        item = self.model().item(index, 0)
+        return item.checkState() == Qt.CheckState.Checked
+
+    def checkedItems(self):
+        return [self.itemText(i) for i in range(self.count()) if self.ifChecked(i)]
+
+    def checkedItemsStr(self):
+        return ';'.join(self.checkedItems()).strip(';')
+
+    def selectItemAction(self, index):
+        self.lineEdit().clear()
+        self.lineEdit().setText(self.checkedItemsStr())
+
+    def setdefaulttext(self):
+        self.setCurrentIndex(self.count()-1)
+
+# 撤销、恢复操作
+class DeleteCommand(QUndoCommand):
+    def __init__(self, table, state_before, state_after):
+        super().__init__()
+        self.table = table
+        self.state_before = state_before
+        self.state_after = state_after
+
+    def undo(self):
+        self.restore_state(self.state_before)
+
+    def redo(self):
+        self.restore_state(self.state_after)
+
+    def restore_state(self, state):
+        for row, col, text in state:
+            item = self.table.item(row, col)
+            if item:
+                item.setText(text)
+
+# 信息价表格
+class xxjtableWidget(QTableWidget):
+    def __init__(self, parent=None):
+        super(xxjtableWidget, self).__init__(parent)
+        self.initable()
+
+    def initable(self):
+        self.setRowCount(0)
+        self.setColumnCount(8)
+        self.setHorizontalHeaderLabels(["材料名称", "规格类型", "单位", "除税价", "含税价", "价格类型", "地区", "期数"])
+        self.setSortingEnabled(True)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.showContextMenu)
+
+        # 创建右键菜单
+        self.contextMenu = QtWidgets.QMenu(self)
+        exportAction = QAction("导出表格", self)
+        exportAction.triggered.connect(self.exportxls)
+        self.contextMenu.addAction(exportAction)
+
+        self.horizontalHeader().sectionResized.connect(lambda: self.resizeRowsToContents())
+        self.horizontalHeader().setSectionsMovable(True)
+
+    def page_up(self):
+        # 向上翻页
+        scroll_value = self.verticalScrollBar().value()
+        scroll_step = 15
+        self.verticalScrollBar().setValue(scroll_value - scroll_step)
+
+    def page_down(self):
+        # 向下翻页
+        scroll_value = self.verticalScrollBar().value()
+        scroll_step = 15
+        self.verticalScrollBar().setValue(scroll_value + scroll_step)
+
+    # Ctrl + A 和判断 C + V
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_C.value:
+            ctrl = QtWidgets.QApplication.keyboardModifiers().ControlModifier
+            if QtWidgets.QApplication.keyboardModifiers() == ctrl:
+                self.copy_selection()
+        elif e.key() == Qt.Key.Key_A.value:
+            ctrl = QtWidgets.QApplication.keyboardModifiers().ControlModifier
+            if QtWidgets.QApplication.keyboardModifiers() == ctrl:
+                selection = QtWidgets.QTableWidgetSelectionRange(0, 0, self.rowCount() - 1, self.columnCount() - 1)
+                self.setRangeSelected(selection, True)
+        elif e.key() == Qt.Key.Key_PageUp:
+            self.page_up()
+        elif e.key() == Qt.Key.Key_PageDown:
+            self.page_down()
+        else:
+            super().keyPressEvent(e)
+
+    # Ctrl + C
+    def copy_selection(self):
+        selected_ranges = self.selectedRanges()[0]
+        text_str = ""
+        for row in range(selected_ranges.topRow(), selected_ranges.bottomRow() + 1):
+            row_str = ""
+            i = 0
+            for col in range(selected_ranges.leftColumn(), selected_ranges.rightColumn() + 1):
+                if self.isColumnHidden(col):
+                    i += 1
+                item = self.item(row, col + i)
+                if item is None:
+                    row_str += " " + '\t'
+                else:
+                    row_str += item.text() + '\t'
+            text_str += row_str[:-1] + '\n'
+        clipboard = QtWidgets.QApplication.clipboard()
+        clipboard.setText(text_str)
+
+    def showContextMenu(self, pos):
+        self.contextMenu.exec(self.mapToGlobal(pos))
+
+    def exportxls(self):
+        file_name, _ = QFileDialog.getSaveFileName(self, '保存报告', '', 'Excel Files (*.xlsx)')
+        if file_name:
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)
+            thin_border = Border(left=Side(style='thin'),
+                                 right=Side(style='thin'),
+                                 top=Side(style='thin'),
+                                 bottom=Side(style='thin'))
+            headers = [self.horizontalHeaderItem(j).text() for j in range(self.columnCount())]
+            ws = wb.create_sheet(title='信息价')
+            for k, title in enumerate(headers):
+                ws.cell(row=1, column=k + 1).value = title
+                ws.cell(row=1, column=k + 1).border = thin_border
+            for i in range(self.rowCount()):
+                for j in range(self.columnCount()):
+                    item = self.item(i, j)
+                    if item is not None:
+                        ws.cell(row=i + 2, column=j + 1).value = item.text()
+                        ws.cell(row=i + 2, column=j + 1).border = thin_border
+            wb.save(file_name)
+
+
+# 自定义列表
+class MytableWidget(QTableWidget):
+    def __init__(self, parent=None):
+        super(MytableWidget, self).__init__(parent)
+        self.undo_stack = QUndoStack(self)
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        undo_action.triggered.connect(self.undo_stack.undo)
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        redo_action.triggered.connect(self.undo_stack.redo)
+        self.addAction(undo_action)
+        self.addAction(redo_action)
+        self.setItemDelegate(QtWidgets.QItemDelegate())
+
+    # Ctrl + A 和判断 C + V
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_C.value:
+            ctrl = QtWidgets.QApplication.keyboardModifiers().ControlModifier
+            if QtWidgets.QApplication.keyboardModifiers() == ctrl:
+                self.copy_selection()
+        elif e.key() == Qt.Key.Key_A.value:
+            ctrl = QtWidgets.QApplication.keyboardModifiers().ControlModifier
+            if QtWidgets.QApplication.keyboardModifiers() == ctrl:
+                selection = QtWidgets.QTableWidgetSelectionRange(0, 0, self.rowCount() - 1, self.columnCount() - 1)
+                self.setRangeSelected(selection, True)
+        elif e.key() == Qt.Key.Key_V.value:
+            ctrl = QtWidgets.QApplication.keyboardModifiers().ControlModifier
+            if QtWidgets.QApplication.keyboardModifiers() == ctrl:
+                if self.objectName() == 'searchtable':
+                    self.past_selection()
+        elif e.key() == Qt.Key.Key_PageUp:
+            self.page_up()
+        elif e.key() == Qt.Key.Key_PageDown:
+            self.page_down()
+        elif e.key() == Qt.Key.Key_Delete:
+            if self.objectName() == 'searchtable':
+                selected_items = self.selectedItems()
+                state_before = [(item.row(), item.column(), item.text()) for item in selected_items]
+                for item in selected_items:
+                    item.setText("")
+                state_after = [(item.row(), item.column(), item.text()) for item in selected_items]
+                undo_command = DeleteCommand(self, state_before, state_after)
+                self.undo_stack.push(undo_command)
+        else:
+            super().keyPressEvent(e)
+
+    # Ctrl + C
+    def copy_selection(self):
+        selected_ranges = self.selectedRanges()[0]
+        text_str = ""
+        for row in range(selected_ranges.topRow(), selected_ranges.bottomRow() + 1):
+            row_str = ""
+            for col in range(selected_ranges.leftColumn(), selected_ranges.rightColumn() + 1):
+                item = self.item(row, col)
+                if item is None:
+                    row_str += " " + '\t'
+                else:
+                    row_str += item.text() + '\t'
+            text_str += row_str[:-1] + '\n'
+        clipboard = QtWidgets.QApplication.clipboard()
+        clipboard.setText(text_str)
+
+    # Ctrl + V
+    def past_selection(self):
+        clipboard = QtWidgets.QApplication.clipboard()
+        text = str(clipboard.text())
+        if text != "":
+            # 定位在第一列才执行复制操作
+            if self.currentColumn() == 0:
+                lst_text = text.split("\n")
+                # 判断已存的行数和将要粘贴的行数的关系
+                exist_rows = self.rowCount() - 1
+                index_row = self.currentRow()
+                for lst in lst_text:  # 循环行
+                    if lst != "":
+                        lst_text_items = lst.split("\t")
+                        if index_row <= exist_rows:
+                            for ii in range(len(lst_text_items)):  # 循环每行对应的列
+                                lst_text_item = lst_text_items[ii]
+                                item = self.item(index_row, ii)
+                                if item is not None:
+                                    item.setText(str(lst_text_item))
+                                else:
+                                    self.setItem(index_row, ii, QtWidgets.QTableWidgetItem(str(lst_text_item)))
+                            index_row += 1
+                        else:
+                            self.insertRow(self.rowCount())
+                            inx = self.rowCount() - 1
+                            for ii in range(len(lst_text_items)):
+                                lst_text_item = lst_text_items[ii]
+                                self.setItem(inx, ii, QtWidgets.QTableWidgetItem(str(lst_text_item)))
+
+    # 上翻页
+    def page_up(self):
+        # 向上翻页
+        scroll_value = self.verticalScrollBar().value()
+        scroll_step = 20
+        self.verticalScrollBar().setValue(scroll_value - scroll_step)
+
+    # 下翻页
+    def page_down(self):
+        # 向下翻页
+        scroll_value = self.verticalScrollBar().value()
+        scroll_step = 20
+        self.verticalScrollBar().setValue(scroll_value + scroll_step)
+
+    # 背景提示
+    def paintEvent(self, event):
+        if self.objectName() == 'Import_table' and self.rowCount() == 0:
+            painter = QPainter(self.viewport())
+            painter.fillRect(event.rect(), QColor(255, 255, 255, 200))  # 半透明白色背景
+            # 绘制背景文字
+            painter.setPen(Qt.GlobalColor.gray)  # 灰色文字
+            painter.setFont(QFont("Arial", 30, QFont.Weight.Bold))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, '如果导入表格报错，你可以执行：\n1. 将导出的表格转换为xlsx保存,再导入。\n2. 导出竣工CJZ(导入前删除临时删除项)，'
+                                                                        '使用cjz导入。\n3. 使用N10重新导表。\n4.CJZ不含清单和定额的工作内容'
+                                                                        '\n5. rpt是N9格式，rptx是N10格式，Z.rpt名称在Z的是总承包格式')
+
+            # 调用父类的 paintEvent 方法来绘制表格内容
+        super().paintEvent(event)
+
+
+# 为编辑框添加双击事件
+class MyLineEdit(QLineEdit):
+    doubleClicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super(MyLineEdit, self).__init__(parent)
+
+    def mouseDoubleClickEvent(self, e):
+        self.doubleClicked.emit()
+
+
+# 为list添加右键菜单-项目列表
+class Mymainitemlist(QListWidget):
+    def __init__(self, parent=None):
+        super(Mymainitemlist, self).__init__(parent)
+        self.verchange_Window = None
+
+    def contextMenuEvent(self, pos):
+        if self.count() > 0:
+            self.contextMenu = QMenu()
+            self.action_openfile = self.contextMenu.addAction('打开数据文件夹')
+            self.action_delete = self.contextMenu.addAction('删除')
+            self.action_rename = self.contextMenu.addAction('重命名')
+            self.action_selectall = self.contextMenu.addAction('全选')
+            self.action_unselectall = self.contextMenu.addAction('全不选')
+            self.action_update = self.contextMenu.addAction('刷新')
+
+            self.contextMenu.popup(QCursor.pos())  # 菜单显示的位置
+            self.action_openfile.triggered.connect(lambda: os.startfile(os.getcwd() + "\\数据文件"))
+            self.action_delete.triggered.connect(lambda: self.delete())
+            self.action_rename.triggered.connect(lambda: self.rename())
+            self.action_selectall.triggered.connect(lambda: self.selectall())
+            self.action_unselectall.triggered.connect(lambda: self.unselectall())
+            self.action_update.triggered.connect(lambda: self.update())
+            self.contextMenu.show()
+
+    @staticmethod
+    def isopen(filename):
+        if not os.access(filename, os.F_OK):
+            return False
+        try:
+            handle = w.CreateFile(filename, w.GENERIC_WRITE, 0,
+                                  None, w.OPEN_EXISTING, w.FILE_ATTRIBUTE_NORMAL, None)
+            if int(handle) == w.INVALID_HANDLE_VALUE:
+                return True
+            w.CloseHandle(handle)
+        except Exception as e:
+            print(e)
+            return True
+        return False
+
+    def delete(self):
+        if self.currentRow() > -1 and self.currentItem().isSelected():
+            file = os.getcwd() + "\\数据文件\\" + self.currentItem().text() + ".db"
+            if self.isopen(file):
+                self.mbox = QMessageBox(self)
+                self.mbox.information(self, '提示！', '数据库被打开，暂时无法删除！\n请稍后再试！')  # 開啟資訊通知的對話視窗，標題 info，內容 hello
+            else:
+                os.remove(file)
+                self.takeItem(self.currentRow())
+
+    def rename(self):
+        if self.currentRow() > -1:
+            text, ok = QInputDialog.getText(self, '修改名称：', '输入新的工程名称', QLineEdit.EchoMode.Normal, self.currentItem().text())
+            if ok:
+                file = os.getcwd() + "\\数据文件\\" + self.currentItem().text() + ".db"
+                if self.isopen(file):
+                    self.mbox = QMessageBox(self)
+                    self.mbox.information(self, '提示！', '数据库被打开，暂时无法修改名称！\n请稍后再试！')
+                else:
+                    os.rename(file, os.getcwd() + "\\数据文件\\" + str(text) + ".db")
+                    self.currentItem().setText(str(text))
+
+    def update(self):
+        self.clear()
+        m = MainWindow()
+        file = os.getcwd() + "\\数据文件"
+        for fileName in os.listdir(file):
+            if fileName.find("db") != -1:
+                item = QListWidgetItem()
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setText(fileName.replace(".db", ""))
+                inx = m.settings.value('itemlist_height', 28, int)
+                item.setSizeHint(QSize(self.width(), inx))
+                self.addItem(item)
+
+    def selectall(self):
+        for i in range(self.count()):
+            self.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def unselectall(self):
+        for i in range(self.count()):
+            self.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+
+# 为list添加右键菜单 - 单位工程列表
+class Mysingleitemlist(QListWidget):
+    def __init__(self, parent=None):
+        super(Mysingleitemlist, self).__init__(parent)
+
+    def contextMenuEvent(self, pos):
+        if self.count() > 0:
+            self.contextMenu = QMenu()
+            self.action_selectall = self.contextMenu.addAction('全选')
+            self.action_unselectall = self.contextMenu.addAction('全不选')
+            self.contextMenu.popup(QCursor.pos())  # 菜单显示的位置
+            self.action_selectall.triggered.connect(lambda: self.selectall())
+            self.action_unselectall.triggered.connect(lambda: self.unselectall())
+            self.contextMenu.show()
+
+    def selectall(self):
+        for i in range(self.count()):
+            self.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def unselectall(self):
+        for i in range(self.count()):
+            self.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+# 主程序
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('清单查询')
+        self.setWindowIcon(QIcon('.\\icon\\icon.ico'))
+        self.settings = QSettings('HySearch', 'HySearch')
+        self.upinfo = '更新说明：\n' \
+                      '2025-01-17 支持信息价数据查询\n' \
+                      '2025-01-15 提供总承包报表模板\n' \
+                      '2024-12-30 提供单位工程树状图；改进数字显示\n' \
+                      '2024-12-04 批量模糊查找问题修复\n' \
+                      '2024-10-23 稍微改进一下导入表格的速度；修正框选汇总\n' \
+                      '2024-10-16 增加提示\n' \
+                      '2024-10-14 增加项目筛选\n' \
+                      '2024-10-12 解决电脑未装Excel导入数据报错\n' \
+                      '2024-09-28 增加分部筛选\n' \
+                      '2024-08-28 恢复主题设置\n' \
+                      '2024-08-18 部分代码优化\n' \
+                      '2024-06-24 增加N10导出表格支持\n' \
+                      '2024-06-23 优化;cjz导入支持\n' \
+                      '2024-05-27 为批量查询增加删除功能\n' \
+                      '2024-05-06 修正翻页问题\n' \
+                      '2024-04-15 导入后立马清除数据;单位工程列表字体跟随\n' \
+                      '2024-04-03 报错机制\n' \
+                      '2024-03-05 回滚调整行高\n' \
+                      '2024-03-04 修正模板导出错误;自由移动目录表的位置\n' \
+                      '2024-03-03 2.0版本 删除查询红色标价；删除横置；删除数据版本；优化配置菜单；优化设置\n'
+        self.soft_ver = 2.25011701
+        # 全局变量
+        self.list_pro = []  # 一个项目的单位工程列表
+        self.projects = []  # 整个软件项目的列表
+        self.tempfile = ''  # 临时文件
+        self.single_name = ''  # 当前查看全部单位工程的项目
+        self.name = ''  # 数据库名称
+        self.count = 0  # 分色标记
+        self.itemlistlocation = True  # 项目列表左右位置归属
+        self.address = os.getcwd() + "\\数据文件\\"
+        self.ui()
+        self.initTable()
+        self.loadSetting()
+        # 初始化数据库内的数据
+        self.findFile()
+        # 信息价参数
+        self.alldatas = []  # 所有的数据库表名本地
+        self.dqlsts = np.zeros((0, 3))  # 地区数据库
+        self.clbs = np.array([])  # 返回结果数组
+        self.qkdatas = np.array([])  # 期刊表对应名称
+        self.cllbs = np.array([])  # 材料列表表
+        self.materil_address = ''
+
+    def ui(self):
+        self.centralwidget = QWidget(self)
+        sizePolicy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        sizePolicy.setHeightForWidth(self.centralwidget.sizePolicy().hasHeightForWidth())
+        self.centralwidget.setSizePolicy(sizePolicy)
+
+        self.horizontalLayout_3 = QVBoxLayout(self.centralwidget)
+        self.horizontalLayout_3.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_3.setSpacing(0)
+
+        self.splitter_2 = QSplitter(parent=self.centralwidget)
+        self.splitter_2.setOrientation(Qt.Orientation.Horizontal)
+        self.splitter_2.setHandleWidth(0)
+        self.splitter_2.splitterMoved.connect(self.handleSplitterMoved)
+
+        '''加编辑框之前加一个布局
+            先用一个布局widget来作为splitter的容器，再在布局里面添加组件
+        '''
+        self.layoutWidget_2 = QWidget(parent=self.splitter_2)
+        self.verticalLayout_18 = QVBoxLayout(self.layoutWidget_2)
+        self.verticalLayout_18.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_18.setSpacing(0)
+
+        '''加一个编辑框'''
+        self.lineEdit_6 = MyLineEdit(parent=self.layoutWidget_2)
+        self.lineEdit_6.setPlaceholderText('输入筛选项目，留空显示全部')
+        self.lineEdit_6.returnPressed.connect(self.filitter_project)
+        self.lineEdit_6.textChanged.connect(self.filitter_project)
+        self.verticalLayout_18.addWidget(self.lineEdit_6)
+
+        '''目录表的设置'''
+        self.itemList = Mymainitemlist(parent=self.layoutWidget_2)
+        self.itemList.setFrameShadow(QFrame.Shadow.Raised)
+        self.itemList.doubleClicked.connect(lambda: self.wprojectname())
+
+        self.listfont = QFont()
+        self.listfont.setPixelSize(self.settings.value('list1_size', 15, int))
+        self.listfont.setFamily(self.settings.value('list1_type', 'Microsoft YaHei UI', str))
+        self.itemList.setFont(self.listfont)
+        self.verticalLayout_18.addWidget(self.itemList)
+
+        '''高级分页框设置'''
+        self.mainContent = QTabWidget(parent=self.splitter_2)
+        self.mainContent.currentChanged.connect(self.xxjsearch)
+
+        self.searchPage = QWidget()
+        self.verticalLayout_16 = QVBoxLayout(self.searchPage)
+        self.verticalLayout_16.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_16.setSpacing(0)
+
+        self.horizontalLayout = QHBoxLayout()
+        self.horizontalLayout.setSizeConstraint(QLayout.SizeConstraint.SetDefaultConstraint)
+        self.horizontalLayout.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout.setSpacing(0)
+
+        # 添加一个可以筛选分部的按钮,按钮即可打开
+        self.checkBox_3 = QCheckBox(parent=self.searchPage)
+        self.checkBox_3.stateChanged.connect(self.showlineEdit_5)
+        self.horizontalLayout.addWidget(self.checkBox_3)
+
+        self.lineEdit_5 = MyLineEdit(parent=self.searchPage)
+        self.lineEdit_5.setPlaceholderText("输入关键字，对分部进行筛选")
+        self.lineEdit_5.returnPressed.connect(lambda: self.searchEdiet_PressKey())
+        self.lineEdit_5.doubleClicked.connect(lambda: self.lineEdit_5.setText(""))
+        self.horizontalLayout.addWidget(self.lineEdit_5)
+        self.lineEdit_5.setVisible(False)
+
+        self.label = QLabel(parent=self.searchPage)
+        self.label.setFrameShadow(QFrame.Shadow.Raised)
+        self.label.setText("关键字：")
+        self.horizontalLayout.addWidget(self.label)
+
+        self.lineEdit = MyLineEdit(parent=self.searchPage)
+        self.lineEdit.setPlaceholderText("在文字中输入空格可以作为任意符号，如 '闸阀 50'")
+        self.lineEdit.returnPressed.connect(lambda: self.searchEdiet_PressKey())
+        self.lineEdit.doubleClicked.connect(lambda: self.lineEdit.setText(""))
+
+        self.horizontalLayout.addWidget(self.lineEdit)
+        self.checkBox = QCheckBox(parent=self.searchPage)
+        self.checkBox.setText("")
+        self.checkBox.setCheckState(Qt.CheckState.Checked)
+        self.horizontalLayout.addWidget(self.checkBox)
+        '''组合框设置'''
+        self.comboBox = QComboBox(parent=self.searchPage)
+        self.comboBox.setInsertPolicy(QComboBox.InsertPolicy.InsertAtBottom)
+        self.comboBox.addItems(("单位工程", "编码", "名称", "单位", "工程量", "单价", "合价", "特征"))
+        self.comboBox.setCurrentIndex(2)
+
+        self.horizontalLayout.addWidget(self.comboBox)
+        self.checkBox_2 = QCheckBox(parent=self.searchPage)
+        self.checkBox_2.setText("")
+        self.horizontalLayout.addWidget(self.checkBox_2)
+        '''组合框设置'''
+        self.comboBox_2 = QComboBox(parent=self.searchPage)
+        self.comboBox_2.setInsertPolicy(QComboBox.InsertPolicy.InsertAtBottom)
+        self.comboBox_2.addItems(("单位工程", "编码", "名称", "单位", "工程量", "单价", "合价", "特征"))
+        self.comboBox_2.setCurrentIndex(7)
+        self.horizontalLayout.addWidget(self.comboBox_2)
+
+        self.radioButton_6 = QRadioButton(parent=self.searchPage)
+        self.radioButton_6.setText("清单")
+        self.horizontalLayout.addWidget(self.radioButton_6)
+        self.radioButton_6.setChecked(True)
+
+        self.radioButton = QRadioButton(parent=self.searchPage)
+        self.radioButton.setText("主材")
+        self.horizontalLayout.addWidget(self.radioButton)
+
+        self.radioButton_1 = QRadioButton(parent=self.searchPage)
+        self.radioButton_1.setText("价格")
+        self.horizontalLayout.addWidget(self.radioButton_1)
+
+        self.radioButton_2 = QRadioButton(parent=self.searchPage)
+        self.radioButton_2.setText("定额")
+        self.horizontalLayout.addWidget(self.radioButton_2)
+
+        self.checkBox_5 = QCheckBox(parent=self.searchPage)
+        self.checkBox_5.setText("去重")
+        self.checkBox_5.setCheckState(Qt.CheckState.Checked)
+        self.horizontalLayout.addWidget(self.checkBox_5)
+
+        self.checkBox_6 = QCheckBox(parent=self.searchPage)
+        self.checkBox_6.setText("去零")
+        self.checkBox_6.setCheckState(Qt.CheckState.Checked)
+        self.horizontalLayout.addWidget(self.checkBox_6)
+
+        spacerItem = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout.addItem(spacerItem)
+        self.verticalLayout_16.addLayout(self.horizontalLayout)
+
+        self.splitter_4 = QSplitter(parent=self.searchPage)
+        self.splitter_4.setOrientation(Qt.Orientation.Vertical)
+        self.splitter_4.setHandleWidth(0)
+        self.widget = QWidget(parent=self.splitter_4)
+        self.horizontalLayout_15 = QHBoxLayout(self.widget)
+        self.horizontalLayout_15.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_15.setSpacing(0)
+        self.verticalLayout_3 = QVBoxLayout()
+        self.verticalLayout_3.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_3.setSpacing(0)
+
+        '''查询结果表格'''
+        self.tableWidget = MytableWidget(parent=self.widget)
+        self.tableWidget.setFrameShape(QFrame.Shape.Box)
+        self.tableWidget.setFrameShadow(QFrame.Shadow.Raised)
+        self.tableWidget.horizontalHeader().setSectionsMovable(True)
+        self.tablefont = QFont()
+        self.tablefont.setPixelSize(self.settings.value('table_size', 11, int))
+        self.tablefont.setFamily(self.settings.value('table_type', 'Microsoft YaHei UI', str))
+        self.tableWidget.setFont(self.tablefont)
+        self.tableWidget.cellClicked.connect(lambda: self.sqlite3_conn_detail())
+        self.tableWidget.cellDoubleClicked.connect(lambda: self.settableWidget_contentorow())
+        self.tableWidget.itemSelectionChanged.connect(lambda: self.settable_addition())
+        self.tableWidget.horizontalHeader().sectionResized.connect(lambda: self.reConment(self.tableWidget))
+        self.verticalLayout_3.addWidget(self.tableWidget)
+
+        self.horizontalLayout_15.addLayout(self.verticalLayout_3)
+        self.verticalScrollBar = QScrollBar(parent=self.widget)
+        self.verticalScrollBar.setOrientation(Qt.Orientation.Vertical)
+        self.horizontalLayout_15.addWidget(self.verticalScrollBar)
+        self.verticalScrollBar.hide()
+
+        self.splitter_3 = QSplitter(parent=self.splitter_4)
+        self.splitter_3.setOrientation(Qt.Orientation.Horizontal)
+        self.splitter_3.setHandleWidth(0)
+
+        self.layoutWidget = QWidget(parent=self.splitter_3)
+        self.verticalLayout = QVBoxLayout(self.layoutWidget)
+        self.verticalLayout.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout.setSpacing(0)
+        self.label_3 = QLabel(parent=self.layoutWidget)
+        self.label_3.setFrameShadow(QFrame.Shadow.Raised)
+        self.label_3.setText("清单明细：")
+        self.verticalLayout.addWidget(self.label_3)
+        self.tableWidget_2 = MytableWidget(parent=self.layoutWidget)
+        self.tableWidget_2.setFrameShape(QFrame.Shape.Box)
+        self.tableWidget_2.setFrameShadow(QFrame.Shadow.Raised)
+        self.tableWidget_2.horizontalHeader().setSectionsMovable(True)
+        self.tableWidget_2.setFont(self.tablefont)
+        self.tableWidget_2.cellClicked.connect(lambda: self.sqlite3_conn_content())
+
+        self.verticalLayout.addWidget(self.tableWidget_2)
+        self.widget = QWidget(parent=self.splitter_3)
+        self.verticalLayout_2 = QVBoxLayout(self.widget)
+        self.verticalLayout_2.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_2.setSpacing(0)
+        self.label_2 = QLabel(parent=self.widget)
+        self.label_2.setFrameShadow(QFrame.Shadow.Raised)
+        self.label_2.setText("项目特征：")
+        self.verticalLayout_2.addWidget(self.label_2)
+        self.splitter_9 = QSplitter(parent=self.widget)
+        self.splitter_9.setOrientation(Qt.Orientation.Vertical)
+        self.splitter_9.setHandleWidth(0)
+        self.plainTextEdit = QPlainTextEdit(parent=self.splitter_9)
+        self.textfont = QFont()
+        self.textfont.setPixelSize(self.settings.value('text_size', 18, int))
+        self.textfont.setFamily(self.settings.value('text_type', 'Microsoft YaHei UI', str))
+        self.plainTextEdit.setFont(self.textfont)
+        self.plainTextEdit.setFrameShape(QFrame.Shape.Box)
+        self.plainTextEdit.setFrameShadow(QFrame.Shadow.Raised)
+        self.plainTextEdit_5 = QPlainTextEdit(parent=self.splitter_9)
+        self.verticalLayout_2.addWidget(self.splitter_9)
+        self.verticalLayout_16.addWidget(self.splitter_4)
+
+        self.mainContent.addTab(self.searchPage, "单个查询")
+        self.batchSearch = QWidget()
+        self.horizontalLayout_6 = QHBoxLayout(self.batchSearch)
+        self.horizontalLayout_6.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_6.setSpacing(0)
+        self.splitter = QSplitter(parent=self.batchSearch)
+        self.splitter.setOrientation(Qt.Orientation.Horizontal)
+        self.splitter.setHandleWidth(0)
+        self.widget2 = QWidget(parent=self.splitter)
+        self.verticalLayout_5 = QVBoxLayout(self.widget2)
+        self.verticalLayout_5.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_5.setSpacing(0)
+        self.horizontalLayout_5 = QHBoxLayout()
+        self.horizontalLayout_5.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        self.horizontalLayout_5.setSpacing(0)
+        spacerItem1 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem1)
+        self.checkBox_7 = QCheckBox(parent=self.widget2)
+        self.checkBox_7.setText("材料")
+        self.checkBox_7.setToolTip("开启后，录入名称和规格可查询\n规格可以为空")
+        self.horizontalLayout_5.addWidget(self.checkBox_7)
+        spacerItem2 = QSpacerItem(5, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem2)
+        self.checkBox_8 = QCheckBox(parent=self.widget2)
+        self.checkBox_8.setText("均价")
+        self.checkBox_8.setToolTip("平均单价以红色显示")
+        self.horizontalLayout_5.addWidget(self.checkBox_8)
+        spacerItem3 = QSpacerItem(5, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem3)
+
+        self.checkBox_9 = QCheckBox(parent=self.widget2)
+        self.checkBox_9.setText("反查")
+        self.checkBox_9.setChecked(True)
+        self.checkBox_9.setToolTip("开启后可以查看查询项\n价格组成明细")
+        self.horizontalLayout_5.addWidget(self.checkBox_9)
+        spacerItem4 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem4)
+
+        self.checkBox_31 = QCheckBox(parent=self.widget2)
+        self.checkBox_31.setText("模糊")
+        self.checkBox_31.setToolTip("开启模糊后将不再进行价格查询\n结果看右边数据")
+        self.horizontalLayout_5.addWidget(self.checkBox_31)
+        spacerItem17 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem17)
+
+        self.pushButton_3 = QPushButton(parent=self.widget2)
+        self.pushButton_3.setText("查询")
+        self.horizontalLayout_5.addWidget(self.pushButton_3)
+        self.pushButton_3.clicked.connect(lambda: self.batchquery())
+
+        spacerItem5 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem5)
+
+        self.pushButton_4 = QPushButton(parent=self.widget2)
+        self.pushButton_4.setText("清空")
+        self.horizontalLayout_5.addWidget(self.pushButton_4)
+        self.pushButton_4.clicked.connect(lambda: self.empthelist())
+        spacerItem6 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem6)
+
+        self.pushButton_5 = QPushButton(parent=self.widget2)
+        self.pushButton_5.setText("复制")
+        self.horizontalLayout_5.addWidget(self.pushButton_5)
+        self.pushButton_5.clicked.connect(lambda: self.copyprice())
+
+        spacerItem20 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem20)
+
+        self.pushButton_6 = QPushButton(parent=self.widget2)
+        self.pushButton_6.setText("增加一行")
+        self.horizontalLayout_5.addWidget(self.pushButton_6)
+        self.pushButton_6.clicked.connect(lambda: self.tableWidget_4.setRowCount(self.tableWidget_4.rowCount() + 1))
+        spacerItem7 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_5.addItem(spacerItem7)
+
+        self.verticalLayout_5.addLayout(self.horizontalLayout_5)
+        self.tableWidget_4 = MytableWidget(parent=self.widget2)
+        self.tableWidget_4.setObjectName('searchtable')
+        self.tableWidget_4.setFrameShape(QFrame.Shape.Box)
+        self.tableWidget_4.setFrameShadow(QFrame.Shadow.Raised)
+        self.tableWidget_4.setGridStyle(Qt.PenStyle.CustomDashLine)
+        self.tableWidget_4.horizontalHeader().setSectionsMovable(True)
+        self.tableWidget_4.setFont(self.tablefont)
+        self.verticalLayout_5.addWidget(self.tableWidget_4)
+
+        self.tableWidget_4.cellClicked.connect(lambda: self.chekedetail())
+        self.tableWidget_5 = MytableWidget(parent=self.splitter)
+        self.tableWidget_5.setFrameShape(QFrame.Shape.Box)
+        self.tableWidget_5.setFrameShadow(QFrame.Shadow.Raised)
+        self.tableWidget_5.horizontalHeader().setSectionsMovable(True)
+        self.tableWidget_5.setFont(self.tablefont)
+        self.tableWidget_5.cellClicked.connect(lambda: self.batchClick())
+        self.tableWidget_5.horizontalHeader().sectionResized.connect(lambda: self.reConment(self.tableWidget_5))
+
+        self.horizontalLayout_6.addWidget(self.splitter)
+        self.mainContent.addTab(self.batchSearch, "批量查询")
+
+        self.detailPage = QWidget()
+        self.verticalLayout_10 = QVBoxLayout(self.detailPage)
+        self.verticalLayout_10.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_10.setSpacing(0)
+        self.splitter_7 = QSplitter(parent=self.detailPage)
+        self.splitter_7.setOrientation(Qt.Orientation.Vertical)
+        self.splitter_7.setHandleWidth(0)
+        self.splitter_5 = QSplitter(parent=self.splitter_7)
+        self.splitter_5.setOrientation(Qt.Orientation.Horizontal)
+        self.splitter_5.setHandleWidth(0)
+        self.widget3 = QWidget(parent=self.splitter_5)
+        self.verticalLayout_8 = QVBoxLayout(self.widget3)
+        self.verticalLayout_8.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_8.setSpacing(0)
+        self.horizontalLayout_2 = QHBoxLayout()
+        self.horizontalLayout_2.setSpacing(0)
+
+        self.label_7 = QLabel(parent=self.widget3)
+        self.label_7.setFrameShadow(QFrame.Shadow.Raised)
+        self.label_7.setText("关键字：")
+        self.label_7.setToolTip("留空直接回车会显示所有内容\n输入关键字回车会筛选")
+        self.horizontalLayout_2.addWidget(self.label_7)
+        self.lineEdit_4 = MyLineEdit(parent=self.widget3)
+        self.lineEdit_4.setPlaceholderText('留空回车显示全部单位工程')
+        self.horizontalLayout_2.addWidget(self.lineEdit_4)
+        self.lineEdit_4.textChanged.connect(lambda: self.projectname_find(self.lineEdit_4.text()))
+        self.lineEdit_4.returnPressed.connect(lambda: self.projectname_find(self.lineEdit_4.text()))
+        self.lineEdit_4.doubleClicked.connect(lambda: self.lineEdit_4.setText(""))
+
+        self.verticalLayout_8.addLayout(self.horizontalLayout_2)
+
+        self.model = QStandardItemModel()
+        self.tree_view = QTreeView(self)
+        self.tree_view.setModel(self.model)
+        font = QFont(self.settings.value('list1_type', 'Microsoft YaHei UI', str), self.settings.value('list1_size', 15, int))
+        self.tree_view.setFont(font)
+        self.tree_view.setHeaderHidden(True)
+        self.model.itemChanged.connect(self.on_item_changed)
+        self.tree_view.doubleClicked.connect(self.on_double_click)
+        self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree_view.customContextMenuRequested.connect(self.show_context_menu)
+        self.verticalLayout_8.addWidget(self.tree_view)
+
+        self.widget4 = QWidget(parent=self.splitter_5)
+        self.verticalLayout_9 = QVBoxLayout(self.widget4)
+        self.verticalLayout_9.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_9.setSpacing(0)
+        self.horizontalLayout_7 = QHBoxLayout()
+        self.horizontalLayout_7.setSpacing(0)
+        self.label_4 = QLabel(parent=self.widget4)
+        self.label_4.setFrameShadow(QFrame.Shadow.Raised)
+        self.label_4.setText("关键字：")
+        self.horizontalLayout_7.addWidget(self.label_4)
+        self.lineEdit_3 = MyLineEdit(parent=self.widget4)
+        self.lineEdit_3.setPlaceholderText('请双击左边的一个项目后，再进行查询')
+        self.horizontalLayout_7.addWidget(self.lineEdit_3)
+        self.lineEdit_3.returnPressed.connect(lambda: self.searchEdiet_PressKey_single())
+        self.lineEdit_3.doubleClicked.connect(lambda: self.lineEdit_3.setText(""))
+
+        spacerItem13 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_7.addItem(spacerItem13)
+
+        self.radioButton_7 = QRadioButton(parent=self.widget4)
+        self.radioButton_7.setText("清单")
+        self.horizontalLayout_7.addWidget(self.radioButton_7)
+        self.radioButton_7.setChecked(True)
+
+        self.radioButton_3 = QRadioButton(parent=self.widget4)
+        self.radioButton_3.setText("主材")
+        self.horizontalLayout_7.addWidget(self.radioButton_3)
+
+        self.radioButton_4 = QRadioButton(parent=self.widget4)
+        self.radioButton_4.setText("价格")
+        self.horizontalLayout_7.addWidget(self.radioButton_4)
+        self.radioButton_5 = QRadioButton(parent=self.widget4)
+
+        self.radioButton_5.setText("定额")
+        self.horizontalLayout_7.addWidget(self.radioButton_5)
+        self.checkBox_10 = QCheckBox(parent=self.widget4)
+
+        self.checkBox_10.setText("去零")
+        self.horizontalLayout_7.addWidget(self.checkBox_10)
+        spacerItem9 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_7.addItem(spacerItem9)
+        self.verticalLayout_9.addLayout(self.horizontalLayout_7)
+        self.tableWidget_6 = MytableWidget(parent=self.widget4)
+        self.tableWidget_6.setFrameShape(QFrame.Shape.Box)
+        self.tableWidget_6.setFrameShadow(QFrame.Shadow.Raised)
+        self.tableWidget_6.horizontalHeader().setSectionsMovable(True)
+        self.tableWidget_6.setFont(self.tablefont)
+        self.verticalLayout_9.addWidget(self.tableWidget_6)
+        self.tableWidget_6.cellClicked.connect(lambda: self.sqlite3_conn_singledetail())
+        self.tableWidget_6.itemSelectionChanged.connect(lambda: self.settable_singleaddition())
+        self.tableWidget_6.cellDoubleClicked.connect(lambda: self.settable_contentorow())
+        self.tableWidget_6.horizontalHeader().sectionResized.connect(lambda: self.reConment(self.tableWidget_6))
+
+        self.splitter_6 = QSplitter(parent=self.splitter_7)
+        self.splitter_6.setOrientation(Qt.Orientation.Horizontal)
+        self.splitter_6.setHandleWidth(0)
+        self.widget5 = QWidget(parent=self.splitter_6)
+        self.verticalLayout_6 = QVBoxLayout(self.widget5)
+        self.verticalLayout_6.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_6.setSpacing(0)
+        self.label_5 = QLabel(parent=self.widget5)
+        self.label_5.setFrameShadow(QFrame.Shadow.Raised)
+        self.label_5.setText("清单明细：")
+        self.verticalLayout_6.addWidget(self.label_5)
+        self.tableWidget_7 = MytableWidget(parent=self.widget5)
+        self.tableWidget_7.setFrameShape(QFrame.Shape.Box)
+        self.tableWidget_7.setFrameShadow(QFrame.Shadow.Raised)
+        self.tableWidget_7.horizontalHeader().setSectionsMovable(True)
+        self.tableWidget_7.setFont(self.tablefont)
+        self.tableWidget_7.cellClicked.connect(lambda: self.sqlite3_conn_singlecontent())
+        self.verticalLayout_6.addWidget(self.tableWidget_7)
+        self.widget6 = QWidget(parent=self.splitter_6)
+        self.verticalLayout_7 = QVBoxLayout(self.widget6)
+        self.verticalLayout_7.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_7.setSpacing(0)
+
+        self.label_6 = QLabel(parent=self.widget6)
+        self.label_6.setFrameShadow(QFrame.Shadow.Raised)
+        self.label_6.setText("项目特征：")
+        self.verticalLayout_7.addWidget(self.label_6)
+        self.splitter_10 = QSplitter(parent=self.widget6)
+        self.splitter_10.setOrientation(Qt.Orientation.Vertical)
+        self.splitter_10.setHandleWidth(0)
+        self.plainTextEdit_2 = QPlainTextEdit(parent=self.splitter_10)
+        self.plainTextEdit_2.setFrameShape(QFrame.Shape.Box)
+        self.plainTextEdit_2.setFrameShadow(QFrame.Shadow.Raised)
+        self.plainTextEdit_2.setFont(self.textfont)
+        self.plainTextEdit_6 = QPlainTextEdit(parent=self.splitter_10)
+        self.plainTextEdit_6.setFont(self.textfont)
+        self.verticalLayout_7.addWidget(self.splitter_10)
+        self.verticalLayout_10.addWidget(self.splitter_7)
+        self.mainContent.addTab(self.detailPage, "单位工程")
+
+        ''' 数据导入页面'''
+        self.dataPage = QWidget()
+        self.verticalLayout_4 = QVBoxLayout(self.dataPage)
+        self.verticalLayout_4.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_4.setSpacing(0)
+        self.horizontalLayout_4 = QHBoxLayout()
+        self.horizontalLayout_4.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_4.setSpacing(0)
+        self.lineEdit_2 = QLineEdit(parent=self.dataPage)
+        self.horizontalLayout_4.addWidget(self.lineEdit_2)
+        spacerItem10 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_4.addItem(spacerItem10)
+
+        self.pushButton = QPushButton(parent=self.dataPage)
+        self.pushButton.setText("添加xls")
+        self.pushButton.clicked.connect(lambda: self.openxls())
+        self.horizontalLayout_4.addWidget(self.pushButton)
+
+        spacerItem11 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_4.addItem(spacerItem11)
+
+        self.pushButton_7 = QPushButton(parent=self.dataPage)
+        self.pushButton_7.setText("添加cjz")
+        self.pushButton_7.setToolTip('最好还是用表格吧，cjz导出比较麻烦。\n支持两种格式的cjz:\ncjz控制价\ncjz结算价')
+        self.pushButton_7.clicked.connect(lambda: self.opencjz())
+        self.horizontalLayout_4.addWidget(self.pushButton_7)
+
+        spacerItem12 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_4.addItem(spacerItem12)
+
+        self.pushButton_2 = QPushButton(parent=self.dataPage)
+        self.pushButton_2.setText("模板")
+        self.pushButton_2.clicked.connect(lambda: self.checklst())
+        self.horizontalLayout_4.addWidget(self.pushButton_2)
+        spacerItem16 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_4.addItem(spacerItem16)
+
+        self.pushButton_1 = QPushButton(parent=self.dataPage)
+        self.pushButton_1.setText("检查更新")
+        self.pushButton_1.clicked.connect(lambda: self.updatasoft())
+
+        self.horizontalLayout_4.addWidget(self.pushButton_1)
+        spacerItem12 = QSpacerItem(10, 20, QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_4.addItem(spacerItem12)
+
+        self.pushButton_10 = QPushButton(parent=self.dataPage)
+        self.pushButton_10.setText("导出表格")
+        self.pushButton_10.setToolTip('主要用于cjz控制价表格导出')
+        self.pushButton_10.clicked.connect(lambda: self.exportReport_origin())
+
+        self.horizontalLayout_4.addWidget(self.pushButton_10)
+        spacerItem18 = QSpacerItem(10, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_4.addItem(spacerItem18)
+
+        self.verticalLayout_4.addLayout(self.horizontalLayout_4)
+        self.tableWidget_3 = MytableWidget(parent=self.dataPage)
+        self.tableWidget_3.setObjectName('Import_table')
+        self.tableWidget_3.setColumnCount(14)
+        self.verticalLayout_4.addWidget(self.tableWidget_3)
+        self.mainContent.addTab(self.dataPage, "添加数据")
+
+        self.tab = QtWidgets.QWidget()
+        self.horizontalLayout_18 = QtWidgets.QHBoxLayout(self.tab)
+        self.horizontalLayout_18.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_18.setSpacing(0)
+        self.verticalLayout_18 = QtWidgets.QVBoxLayout()
+        self.verticalLayout_19 = QtWidgets.QVBoxLayout()
+        self.horizontalLayout_16 = QtWidgets.QHBoxLayout()
+        spacerItem16 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_16.addItem(spacerItem16)
+
+        self.label_22 = QLabel(parent=self.tab)
+        self.label_22.setText('地区')
+        self.horizontalLayout_16.addWidget(self.label_22)
+
+        self.comboBox_dq = QComboBox(parent=self.tab)
+        self.horizontalLayout_16.addWidget(self.comboBox_dq)
+        self.comboBox_dq.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.comboBox_dq.setMinimumContentsLength(1)
+        self.comboBox_dq.currentIndexChanged.connect(self.adjustnf)
+
+        self.label_23 = QLabel(parent=self.tab)
+        self.label_23.setText('年份')
+        self.horizontalLayout_16.addWidget(self.label_23)
+        self.comboBox_nf = CustomComboBox(parent=self.tab)
+        self.horizontalLayout_16.addWidget(self.comboBox_nf)
+
+        self.label_24 = QLabel(parent=self.tab)
+        self.label_24.setText('输入关键词：')
+        self.horizontalLayout_16.addWidget(self.label_24)
+        self.lineEdit_keyword = QLineEdit(parent=self.tab)
+        self.lineEdit_keyword.setPlaceholderText('留空查看全部，但是可能会卡')
+        self.horizontalLayout_16.addWidget(self.lineEdit_keyword)
+        self.lineEdit_keyword.returnPressed.connect(self.search_data_from_first)
+        self.pushButton_search = QPushButton(parent=self.tab)
+        self.pushButton_search.setText('查询')
+        self.pushButton_search.clicked.connect(self.search_data_from_first)
+        self.horizontalLayout_16.addWidget(self.pushButton_search)
+
+        spacerItem17 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_16.addItem(spacerItem17)
+        self.verticalLayout_19.addLayout(self.horizontalLayout_16)
+        self.horizontalLayout_17 = QtWidgets.QHBoxLayout()
+        spacerItem18 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_17.addItem(spacerItem18)
+
+        self.label_28 = QtWidgets.QLabel(parent=self.tab)
+        self.label_28.setText('二次筛选：')
+        self.horizontalLayout_17.addWidget(self.label_28)
+
+        self.lineEdit_5 = QLineEdit(parent=self.tab)
+        self.lineEdit_5.setPlaceholderText('关键词：名称')
+        self.horizontalLayout_17.addWidget(self.lineEdit_5)
+        self.lineEdit_5.textChanged.connect(lambda: self.find_two_result())
+
+        self.lineEdit_1 = QLineEdit(parent=self.tab)
+        self.lineEdit_1.setPlaceholderText('关键词：规格')
+        self.horizontalLayout_17.addWidget(self.lineEdit_1)
+        self.lineEdit_1.textChanged.connect(lambda: self.find_two_result())
+
+        self.lineEdit_7 = QLineEdit(parent=self.tab)
+        self.lineEdit_7.setPlaceholderText('关键词：单位')
+        self.horizontalLayout_17.addWidget(self.lineEdit_7)
+        self.lineEdit_7.textChanged.connect(lambda: self.find_two_result())
+
+        self.lineEdit_8 = QLineEdit(parent=self.tab)
+        self.lineEdit_8.setPlaceholderText('关键词：价格类型')
+        self.horizontalLayout_17.addWidget(self.lineEdit_8)
+        self.lineEdit_8.textChanged.connect(lambda: self.find_two_result())
+
+        self.comboBox_dqxx = CustomComboBox(parent=self.tab)
+        self.horizontalLayout_17.addWidget(self.comboBox_dqxx)
+        self.comboBox_dqxx.lineEdit().setPlaceholderText('关键词：地区')
+        self.comboBox_dqxx.currentTextChanged.connect(lambda: self.find_two_result())
+
+        self.comboBox_qsxx = CustomComboBox(parent=self.tab)
+        self.horizontalLayout_17.addWidget(self.comboBox_qsxx)
+        self.comboBox_qsxx.lineEdit().setPlaceholderText('关键词：月份')
+        self.comboBox_qsxx.currentTextChanged.connect(lambda: self.find_two_result())
+
+        spacerItem19 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_17.addItem(spacerItem19)
+
+        self.verticalLayout_19.addLayout(self.horizontalLayout_17)
+        self.verticalLayout_18.addLayout(self.verticalLayout_19)
+        self.splitter_11 = QtWidgets.QSplitter(parent=self.tab)
+        self.splitter_11.setHandleWidth(2)
+        self.layoutWidget_3 = QtWidgets.QWidget(parent=self.splitter_11)
+        self.verticalLayout_20 = QtWidgets.QVBoxLayout(self.layoutWidget_3)
+        self.verticalLayout_20.setContentsMargins(0, 0, 0, 0)
+
+        self.label_25 = DoubleClickLabel(parent=self.layoutWidget_3)
+        self.label_25.setText('未下载的期数：')
+        self.label_25.setToolTip('请于宏业中\n维护-价格表维护-价格表维护中心\n下载，未下载的数据库\n更新，有更新提示的数据库')
+        self.label_25.doubleClicked.connect(lambda: self.check_datas_integrity())
+        self.verticalLayout_20.addWidget(self.label_25)
+        self.listWidget_2 = QtWidgets.QListWidget(parent=self.layoutWidget_3)
+        self.verticalLayout_20.addWidget(self.listWidget_2)
+        self.tableWidget_xxj = xxjtableWidget(parent=self.splitter_11)
+        self.verticalLayout_18.addWidget(self.splitter_11)
+        self.horizontalLayout_18.addLayout(self.verticalLayout_18)
+        self.mainContent.addTab(self.tab, "信息价")
+
+        # 设置页面
+        self.dataPage = QWidget()
+        self.horizontalLayout_13 = QHBoxLayout(self.dataPage)
+        self.horizontalLayout_13.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_13.setSpacing(0)
+        self.verticalLayout_12 = QVBoxLayout()
+        self.verticalLayout_12.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_12.setSpacing(0)
+        self.groupBox = QGroupBox(parent=self.dataPage)
+        self.groupBox.setTitle("常规设置" + "  当前版本：" + str(self.soft_ver))
+        self.verticalLayout_4 = QVBoxLayout(self.groupBox)
+
+        self.label_30 = QLabel(parent=self.groupBox)
+        self.label_30.setText("文字设置及主题设置需重启软件后可实现，可通过预览确定样式！")
+        self.label_30.setStyleSheet('''color:red;''')
+        self.verticalLayout_4.addWidget(self.label_30)
+
+        self.checkBox_19 = QtWidgets.QCheckBox(parent=self.groupBox)
+        self.checkBox_19.setText("是否自动换行")
+        self.checkBox_19.setChecked(False)
+        self.verticalLayout_4.addWidget(self.checkBox_19)
+
+        self.checkBox_21 = QtWidgets.QCheckBox(parent=self.groupBox)
+        self.checkBox_21.clicked.connect(lambda: self.change_splitter())
+        self.checkBox_21.setText("是否收起信息价未下载期数")
+        self.checkBox_21.setChecked(False)
+        self.verticalLayout_4.addWidget(self.checkBox_21)
+
+
+        self.horizontalLayout_8 = QtWidgets.QHBoxLayout()
+        self.label_16 = QtWidgets.QLabel(parent=self.groupBox)
+        self.label_16.setText("软件主题：")
+        self.horizontalLayout_8.addWidget(self.label_16)
+        self.radioButton_8 = QtWidgets.QRadioButton(parent=self.groupBox)
+        self.radioButton_8.setText("auto")
+        self.radioButton_8.setChecked(True)
+        self.horizontalLayout_8.addWidget(self.radioButton_8)
+        self.radioButton_9 = QtWidgets.QRadioButton(parent=self.groupBox)
+        self.radioButton_9.setText("dark")
+        self.horizontalLayout_8.addWidget(self.radioButton_9)
+        self.radioButton_10 = QtWidgets.QRadioButton(parent=self.groupBox)
+        self.radioButton_10.setText("light")
+        self.horizontalLayout_8.addWidget(self.radioButton_10)
+        spacerItem11 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding,
+                                             QtWidgets.QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_8.addItem(spacerItem11)
+
+        self.verticalLayout_4.addLayout(self.horizontalLayout_8)
+
+        self.verticalLayout_12.addWidget(self.groupBox)
+        self.groupBox_2 = QGroupBox(parent=self.dataPage)
+        self.groupBox_2.setTitle("字体设置")
+        self.verticalLayout_11 = QVBoxLayout(self.groupBox_2)
+        self.horizontalLayout_9 = QHBoxLayout()
+        self.label_8 = QLabel(parent=self.groupBox_2)
+        self.label_8.setText("项目特征：")
+        self.horizontalLayout_9.addWidget(self.label_8)
+        self.fontComboBox = QFontComboBox(parent=self.groupBox_2)
+        self.fontComboBox.currentFontChanged.connect(lambda: self.textfontadjust())
+        self.horizontalLayout_9.addWidget(self.fontComboBox)
+        self.label_9 = QLabel(parent=self.groupBox_2)
+        self.label_9.setText("字号：")
+        self.horizontalLayout_9.addWidget(self.label_9)
+        self.spinBox = QSpinBox(parent=self.groupBox_2)
+        self.spinBox.setValue(18)
+        self.spinBox.valueChanged.connect(lambda: self.textfontadjust())
+        self.horizontalLayout_9.addWidget(self.spinBox)
+        spacerItem12 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_9.addItem(spacerItem12)
+        self.verticalLayout_11.addLayout(self.horizontalLayout_9)
+        self.horizontalLayout_10 = QHBoxLayout()
+        self.label_11 = QLabel(parent=self.groupBox_2)
+        self.label_11.setText("工程列表：")
+        self.horizontalLayout_10.addWidget(self.label_11)
+        self.fontComboBox_2 = QFontComboBox(parent=self.groupBox_2)
+        self.fontComboBox_2.currentFontChanged.connect(lambda: self.lstfontadjust())
+
+        self.horizontalLayout_10.addWidget(self.fontComboBox_2)
+        self.label_10 = QLabel(parent=self.groupBox_2)
+        self.label_10.setText("字号：")
+        self.horizontalLayout_10.addWidget(self.label_10)
+        self.spinBox_2 = QSpinBox(parent=self.groupBox_2)
+        self.spinBox_2.setValue(15)
+        self.spinBox_2.valueChanged.connect(lambda: self.lstfontadjust())
+        self.horizontalLayout_10.addWidget(self.spinBox_2)
+        self.label_17 = QLabel(parent=self.groupBox_2)
+        self.label_17.setText("行高：")
+        self.horizontalLayout_10.addWidget(self.label_17)
+        self.spinBox_5 = QSpinBox(parent=self.groupBox_2)
+        self.spinBox_5.setValue(28)
+        self.horizontalLayout_10.addWidget(self.spinBox_5)
+        self.spinBox_5.valueChanged.connect(lambda: self.lstheightadjust())
+        spacerItem13 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_10.addItem(spacerItem13)
+        self.verticalLayout_11.addLayout(self.horizontalLayout_10)
+        self.horizontalLayout_11 = QHBoxLayout()
+        self.label_13 = QLabel(parent=self.groupBox_2)
+        self.label_13.setText("单位工程：")
+        self.horizontalLayout_11.addWidget(self.label_13)
+        self.fontComboBox_3 = QFontComboBox(parent=self.groupBox_2)
+        self.fontComboBox_3.currentFontChanged.connect(lambda: self.lstfontadjust())
+        self.horizontalLayout_11.addWidget(self.fontComboBox_3)
+        self.label_12 = QLabel(parent=self.groupBox_2)
+        self.label_12.setText("字号：")
+        self.horizontalLayout_11.addWidget(self.label_12)
+        self.spinBox_3 = QSpinBox(parent=self.groupBox_2)
+        self.spinBox_3.setValue(15)
+        self.spinBox_3.valueChanged.connect(lambda: self.lstfontadjust())
+        self.horizontalLayout_11.addWidget(self.spinBox_3)
+        self.label_18 = QLabel(parent=self.groupBox_2)
+        self.label_18.setText("行高：")
+        self.horizontalLayout_11.addWidget(self.label_18)
+        self.spinBox_6 = QSpinBox(parent=self.groupBox_2)
+        self.spinBox_6.setValue(28)
+        self.horizontalLayout_11.addWidget(self.spinBox_6)
+        self.spinBox_6.valueChanged.connect(lambda: self.lstheightadjust())
+        spacerItem14 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_11.addItem(spacerItem14)
+
+        self.verticalLayout_11.addLayout(self.horizontalLayout_11)
+        self.horizontalLayout_12 = QHBoxLayout()
+        self.label_14 = QLabel(parent=self.groupBox_2)
+        self.label_14.setText("数据表格：")
+        self.horizontalLayout_12.addWidget(self.label_14)
+        self.fontComboBox_4 = QFontComboBox(parent=self.groupBox_2)
+        self.fontComboBox_4.currentFontChanged.connect(lambda: self.tablefontadjust())
+        self.horizontalLayout_12.addWidget(self.fontComboBox_4)
+        self.label_15 = QLabel(parent=self.groupBox_2)
+        self.label_15.setText("字号：")
+        self.horizontalLayout_12.addWidget(self.label_15)
+        self.spinBox_4 = QSpinBox(parent=self.groupBox_2)
+        self.spinBox_4.setValue(11)
+        self.spinBox_4.valueChanged.connect(lambda: self.tablefontadjust())
+        self.horizontalLayout_12.addWidget(self.spinBox_4)
+        spacerItem15 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_12.addItem(spacerItem15)
+        self.verticalLayout_11.addLayout(self.horizontalLayout_12)
+
+        self.horizontalLayout_20 = QHBoxLayout()
+
+        self.radio_N9 = QRadioButton(parent=self.groupBox_2)
+        self.radio_N9.clicked.connect(lambda: self.change_data_from())
+        self.horizontalLayout_20.addWidget(self.radio_N9)
+        self.label_N9 = QLabel(parent=self.groupBox_2)
+        self.label_N9.setText("N9数据库地址： ")
+        self.horizontalLayout_20.addWidget(self.label_N9)
+
+        self.N9lineEdite = QLineEdit(parent=self.groupBox_2)
+        self.N9lineEdite.setReadOnly(True)
+        self.horizontalLayout_20.addWidget(self.N9lineEdite)
+
+        self.N9pushButton = QPushButton(parent=self.groupBox_2)
+        self.N9pushButton.setText('选择')
+        self.N9pushButton.setToolTip('N9选择软件安装目录下的DAT文件夹')
+        self.N9pushButton.clicked.connect(lambda: self.get_data_file(self.N9lineEdite))
+        self.horizontalLayout_20.addWidget(self.N9pushButton)
+        spacerItem21 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_20.addItem(spacerItem21)
+        self.verticalLayout_11.addLayout(self.horizontalLayout_20)
+
+        self.horizontalLayout_21 = QHBoxLayout()
+        self.radio_N10 = QRadioButton(parent=self.groupBox_2)
+        self.radio_N10.clicked.connect(lambda: self.change_data_from())
+        self.horizontalLayout_21.addWidget(self.radio_N10)
+        self.label_N10 = QLabel(parent=self.groupBox_2)
+        self.label_N10.setText("N10数据库地址：")
+        self.horizontalLayout_21.addWidget(self.label_N10)
+
+        self.N10lineEdite = QLineEdit(parent=self.groupBox_2)
+        self.N10lineEdite.setReadOnly(True)
+        self.horizontalLayout_21.addWidget(self.N10lineEdite)
+
+        self.N10pushButton = QPushButton(parent=self.groupBox_2)
+        self.N10pushButton.setText('选择')
+        self.N10pushButton.setToolTip('N10选择软件安装目录下的DATABASE文件夹')
+        self.N10pushButton.clicked.connect(lambda: self.get_data_file(self.N10lineEdite))
+        self.horizontalLayout_21.addWidget(self.N10pushButton)
+        spacerItem22 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.horizontalLayout_21.addItem(spacerItem22)
+        self.verticalLayout_11.addLayout(self.horizontalLayout_21)
+
+        self.verticalLayout_12.addWidget(self.groupBox_2)
+
+        self.groupBox_3 = QGroupBox(parent=self.dataPage)
+        self.groupBox_3.setTitle("字体设置效果展示")
+        self.horizontalLayout_14 = QHBoxLayout(self.groupBox_3)
+        self.horizontalLayout_14.setObjectName("horizontalLayout_14")
+
+        self.splitter_8 = QSplitter(parent=self.groupBox_3)
+        self.splitter_8.setOrientation(Qt.Orientation.Horizontal)
+        self.widget = QWidget(parent=self.splitter_8)
+        self.verticalLayout_13 = QVBoxLayout(self.widget)
+
+        self.label_19 = QLabel(parent=self.widget)
+        self.label_19.setText('项目特征效果演示：')
+        self.verticalLayout_13.addWidget(self.label_19)
+        self.plainTextEdit_3 = QPlainTextEdit(parent=self.widget)
+        self.plainTextEdit_3.setPlainText(
+            '1.名称：单层百叶风口\n2.规格、材质：800x300\n3.安装部位及方式：综合考虑\n4.风口颜色及表面处理工艺综合考虑，满足本项目精装修要求\n5.支架形式、材质：型钢综合，减振吊架\n6'
+            '.除锈、刷油及防腐要求：支吊架表面除锈后刷防锈漆与调和漆各二遍\n7.其他：满足设计规范、验收规范及现行技术标准要求')
+        self.verticalLayout_13.addWidget(self.plainTextEdit_3)
+        self.widget1 = QWidget(parent=self.splitter_8)
+        self.widget1.setObjectName("widget1")
+        self.verticalLayout_14 = QVBoxLayout(self.widget1)
+        self.label_20 = QLabel(parent=self.widget1)
+        self.label_20.setText('表格内容演示：')
+        self.verticalLayout_14.addWidget(self.label_20)
+        self.tableWidget_8 = MytableWidget(parent=self.widget1)
+
+        self.verticalLayout_14.addWidget(self.tableWidget_8)
+        self.widget2 = QWidget(parent=self.splitter_8)
+        self.verticalLayout_15 = QVBoxLayout(self.widget2)
+        self.label_21 = QLabel(parent=self.widget2)
+        self.label_21.setText('工程表格内容演示：')
+        self.verticalLayout_15.addWidget(self.label_21)
+        self.listWidget = QListWidget(parent=self.widget2)
+        for i in range(6):
+            item = QListWidgetItem()
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setText('测试工程名称' + str(i))
+            self.listWidget.addItem(item)
+        self.verticalLayout_15.addWidget(self.listWidget)
+        self.horizontalLayout_14.addWidget(self.splitter_8)
+        self.verticalLayout_12.addWidget(self.groupBox_3)
+
+        self.plainTextEdit_4 = QPlainTextEdit(parent=self.dataPage)
+        self.plainTextEdit_4.setPlainText(self.upinfo)
+        self.verticalLayout_12.addWidget(self.plainTextEdit_4)
+
+        self.horizontalLayout_13.addLayout(self.verticalLayout_12)
+        self.mainContent.addTab(self.dataPage, "软件设置")
+
+        self.horizontalLayout_3.addWidget(self.splitter_2)
+
+        self.setCentralWidget(self.centralwidget)
+
+        # 添加状态栏
+        self.statusbar = QStatusBar(self)
+        self.setStatusBar(self.statusbar)
+
+    # 筛选项目
+    def filitter_project(self):
+        search_word = self.lineEdit_6.text().strip()
+        pattern = search_word.replace(' ', '.*?')
+        if search_word:
+            filtered_projects = [project for project in self.projects if len(re.findall(pattern, str(project))) > 0]
+        else:
+            filtered_projects = self.projects
+        self.itemList.clear()
+        self.add_project_items(filtered_projects)
+
+    # 添加项目到itemlist
+    def add_project_items(self, projects):
+        inx = self.settings.value('itemlist_height', 28, int)
+        for project in projects:
+            item = QListWidgetItem()
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setText(project)
+            item.setSizeHint(QSize(self.itemList.width(), inx))
+            self.itemList.addItem(item)
+
+    # 增加分部筛选的框框
+    def showlineEdit_5(self, state):
+        if state == Qt.CheckState.Checked.value:
+            self.lineEdit_5.setVisible(True)
+        else:
+            self.lineEdit_5.setVisible(False)
+
+    # 数据库查询操作-简化和增加错误反馈
+    def sqlconnect(self, file, sql):
+        try:
+            conn = sqlite3.connect(file)
+            c = conn.cursor()
+            cursor = c.execute(sql)
+            lsts = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            return lsts
+        except Exception as e:
+            self.plainTextEdit_4.insertPlainText(str(e))
+            return []
+
+    # 移形换位 左边是1，右边是7
+    def handleSplitterMoved(self, pos):
+        if pos == 1:
+            self.splitter_2.insertWidget(0, self.mainContent)
+            self.splitter_2.insertWidget(1, self.layoutWidget_2)
+            self.splitter_2.setSizes([20, 80])
+            self.itemlistlocation = False
+            self.fixSplitter()
+        if self.width() - pos == 7:
+            self.splitter_2.insertWidget(0, self.layoutWidget_2)
+            self.splitter_2.insertWidget(1, self.mainContent)
+            self.splitter_2.setSizes([80, 20])
+            self.itemlistlocation = True
+            self.fixSplitter()
+
+    def fixSplitter(self):
+        QTest.qWaitForWindowExposed(self.splitter_2)
+        QTest.qWaitForWindowActive(self.splitter_2)
+        QTest.mouseClick(self.splitter_2.handle(0), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+
+    # 更新程序
+    def updatasoft(self):
+        resp = requests.get('https://missrou.github.io/')
+        if str(resp) == '<Response [200]>':
+            s = resp.text
+            ver = s[s.find('<p>') + 3:s.find('</p>')]
+            h = s[s.find('<a href="') + len('<a href="'):s.find('">密')]
+            upd = s[s.find('<h4>' + ver) + len('<h4>'):s.find('<h4>' + str(self.soft_ver))].replace('</h4>', '')
+            upd = upd.replace('<h4>', '')
+            upd = upd.replace(' ', '')
+            ver_f = float(ver)
+            self.mbox = QMessageBox(self)
+            if ver_f > self.soft_ver:
+                Yes = self.mbox.question(self, '提示！密码：1234', '软件有更新的版本，是否打开网页下载？\n密码：1234\n更新内容：\n' + upd)
+                if Yes == 16384:
+                    webbrowser.open(h)
+            else:
+                self.mbox.information(self, '提示！', '当前版本：【' + str(self.soft_ver) + '】是最新版本!')
+        else:
+            pass
+
+    # 检查模板表
+    def checklst(self):
+        self.mbox = QMessageBox(self)
+        self.mbox.information(self, '提示！', '即将打开模板文件位置\n请自行将模板表添加到宏业报表组')
+        os.startfile(os.getcwd() + "\\icon")
+
+    # 加载数据库文件
+    def findFile(self):
+        file = os.getcwd() + "\\数据文件\\"
+        if not os.path.exists(file):
+            os.mkdir(file)
+        self.itemList.clear()
+        self.projects = []
+        inx = self.settings.value('itemlist_height', 28, int)
+        for fileName in os.listdir(file):
+            if fileName.find("db") != -1:
+                item = QListWidgetItem()
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setText(fileName.replace(".db", ""))
+                self.projects.append(fileName.replace(".db", ""))
+                item.setSizeHint(QSize(self.itemList.width(), inx))
+                self.itemList.addItem(item)
+                os.chmod(file + fileName, stat.S_IWRITE)
+
+    # 进行查询数据的操作
+    def searchEdiet_PressKey(self):
+        keyword = self.lineEdit.text().strip()
+        if keyword != "":
+            todolist = []
+            for i in range(self.itemList.count()):
+                if self.itemList.item(i).checkState() == Qt.CheckState.Checked:
+                    todolist.append(self.itemList.item(i).text())
+            self.tableWidget.setRowCount(0)
+            # 取消排序状态
+            self.tableWidget.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+            self.count = 0
+            self.tableWidget.setSortingEnabled(False)
+            for lst in todolist:
+                sql = self.main_creatsql(keyword)
+                self.count += 1
+                self.sqlite3_conn_mainsearch(lst, sql)
+            if self.isdatehe():
+                self.tableWidget.showColumn(8)
+            else:
+                self.tableWidget.hideColumn(8)
+            self.reConment(self.tableWidget)
+            self.tableWidget.setSortingEnabled(True)
+
+    # 单位工程查询数据的操作
+    def searchEdiet_PressKey_single(self):
+        keyword = self.lineEdit_3.text().strip()
+        if keyword != "":
+            self.tableWidget_6.setRowCount(0)
+            self.tableWidget_6.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+            sqls = ""
+            unit_name_lst = self.collect_checked_paths()
+            print(unit_name_lst)
+            for unit_name in unit_name_lst:
+                    sqls = sqls + " 单位工程 like '%" + unit_name + "%' or"
+            if sqls != "":
+                sqls = " and (" + sqls[1:-3] + ")"
+                sql = self.single_creatsql(sqls, keyword)
+                self.tableWidget_6.setSortingEnabled(False)
+                self.sqlite3_conn_singlesearch(sql)
+                self.tableWidget_6.setItemDelegate(QtWidgets.QItemDelegate())
+                self.tableWidget_6.setSortingEnabled(True)
+
+    # 主界面清单查询
+    def sqlite3_conn_mainsearch(self, data, sql):
+        lsts = self.sqlconnect(self.address + data + '.db', sql)
+        for row in lsts:
+            self.tableWidget.insertRow(self.tableWidget.rowCount())
+            inx = self.tableWidget.rowCount() - 1
+            text = str(row[4] + '\\' + row[5])
+            # 1 分类 2 同项 3 清单号 4 单位工程 5 分部 6 项目号 7 编码 8 名称 9 单位 10 工程量 11 单价 12 合价 13 特征 14 内容
+            self.tableWidget.setItem(inx, 0, QTableWidgetItem(data + '\\' + text))
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[3])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget.setItem(inx, 1, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[2])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget.setItem(inx, 2, item)
+            self.tableWidget.setItem(inx, 3, QTableWidgetItem(str(row[8])))
+            item = QTableWidgetItem(str(row[9]))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget.setItem(inx, 4, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[10])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget.setItem(inx, 5, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[11])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget.setItem(inx, 6, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[12])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget.setItem(inx, 7, item)
+            self.tableWidget.setItem(inx, 8, QTableWidgetItem(str(row[13])))
+            self.tableWidget.setItem(inx, self.tableWidget.columnCount() - 1, QTableWidgetItem(data))
+            if self.count % 2 == 0:
+                for i in range(self.tableWidget.columnCount()):
+                    self.tableWidget.item(inx, i).setBackground(QColor(0, 181, 181))
+
+    # 判断是否筛选特征
+    def isdatehe(self):
+        cond1 = self.comboBox.currentText()
+        cond2 = self.comboBox_2.currentText()
+        check1_state = self.checkBox.checkState() == Qt.CheckState.Checked
+        check2_state = self.checkBox_2.checkState() == Qt.CheckState.Checked
+        return (check1_state and cond1 == '特征') or (check2_state and cond2 == '特征')
+
+    # 单位工程清单查询
+    def sqlite3_conn_singlesearch(self, sql):
+        lsts = self.sqlconnect(self.address + self.single_name + '.db', sql)
+        for row in lsts:
+            # 1 分类 2 同项 3 清单号 4 单位工程 5 分部 6 项目号 7 编码 8 名称 9 单位 10 工程量 11 单价 12 合价 13 特征 14 内容
+            self.tableWidget_6.insertRow(self.tableWidget_6.rowCount())
+            inx = self.tableWidget_6.rowCount() - 1
+            text = str(row[5])
+            item = QTableWidgetItem(text)
+            self.tableWidget_6.setItem(inx, 0, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[3])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget_6.setItem(inx, 1, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[2])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget_6.setItem(inx, 2, item)
+            self.tableWidget_6.setItem(inx, 3, QTableWidgetItem(str(row[8])))
+            item = QTableWidgetItem(str(row[9]))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget_6.setItem(inx, 4, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[10])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget_6.setItem(inx, 5, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[11])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget_6.setItem(inx, 6, item)
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, row[12])
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget_6.setItem(inx, 7, item)
+            self.reConment(self.tableWidget_6)
+
+    # 主查询页面点击查看定额内容
+    def sqlite3_conn_detail(self):
+        if len(self.tableWidget.selectedItems()) == 1:
+            item = self.tableWidget.item(self.tableWidget.currentRow(), self.tableWidget.columnCount() - 1)
+            if item is not None:
+                data = item.text()
+                self.name = data
+                item = self.tableWidget.item(self.tableWidget.currentRow(), 2)
+                if item is not None:
+                    ids = item.text()
+                    file = self.address + data + '.db'
+                    if os.path.exists(file):
+                        lsts = self.sqlconnect(file, "select * from 工程表 where 同项 = " + ids)
+                        self.tableWidget_2.setRowCount(0)
+                        i = 1
+                        for row in lsts:
+                            self.tableWidget_2.insertRow(self.tableWidget_2.rowCount())
+                            inx = self.tableWidget_2.rowCount() - 1
+                            text = str(row[7])
+                            if i == 1 and text[:1] != '0':
+                                text = '0' + text
+                            self.tableWidget_2.setItem(inx, 0, QTableWidgetItem(text))
+                            self.tableWidget_2.setItem(inx, 1, QTableWidgetItem(str(row[8])))
+                            item = QTableWidgetItem(str(row[9]))
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                            self.tableWidget_2.setItem(inx, 2, item)
+                            item = QTableWidgetItem(str(row[10]))
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                            self.tableWidget_2.setItem(inx, 3, item)
+                            item = QTableWidgetItem(str(row[11]))
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                            self.tableWidget_2.setItem(inx, 4, item)
+                            item = QTableWidgetItem(str(row[12]))
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                            self.tableWidget_2.setItem(inx, 5, item)
+
+                            if i == 1:
+                                self.plainTextEdit.setPlainText(str(row[13]))
+                                item = self.tableWidget.item(self.tableWidget.currentRow(), 0)
+                                if item is not None:
+                                    text = item.text()
+                                    self.statusbar.showMessage(f"{text} 第{str(row[3])}项", 0)
+                            i += 1
+                        self.reConment(self.tableWidget_2)
+
+    # 单位工程查询页点击查看定额
+    def sqlite3_conn_singledetail(self):
+        if len(self.tableWidget_6.selectedItems()) == 1:
+            item = self.tableWidget_6.item(self.tableWidget_6.currentRow(), 2)
+            if item is not None:
+                ids = item.text()
+                file = self.address + self.single_name + '.db'
+                if os.path.exists(file):
+                    lsts = self.sqlconnect(file, f"select * from 工程表 where 同项 = {ids}")
+                    self.tableWidget_7.setRowCount(0)
+                    i = 1
+                    for row in lsts:
+                        self.tableWidget_7.insertRow(self.tableWidget_7.rowCount())
+                        inx = self.tableWidget_7.rowCount() - 1
+                        text = str(row[7])
+                        if i == 1 and text[:1] != '0':
+                            text = '0' + text
+                        self.tableWidget_7.setItem(inx, 0, QTableWidgetItem(text))
+                        self.tableWidget_7.setItem(inx, 1, QTableWidgetItem(str(row[8])))
+                        item = QTableWidgetItem(str(row[9]))
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                        self.tableWidget_7.setItem(inx, 2, item)
+                        item = QTableWidgetItem(str(row[10]))
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        self.tableWidget_7.setItem(inx, 3, item)
+                        item = QTableWidgetItem(str(row[11]))
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        self.tableWidget_7.setItem(inx, 4, item)
+                        item = QTableWidgetItem(str(row[12]))
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        self.tableWidget_7.setItem(inx, 5, item)
+                        if i == 1:
+                            self.plainTextEdit_2.setPlainText(str(row[13]))
+                            text = f"{self.single_name}\\{row[4]}\\{row[5]}"
+                            self.statusbar.showMessage(f"{text} 第{str(row[3])}项", 0)
+                        i += 1
+                    self.reConment(self.tableWidget_7)
+
+    # 判断符号
+    @staticmethod
+    def sy0bles(t):
+        if t not in ['<', '>', '=']:
+            return '=' + str(t)
+        else:
+            return t
+
+    # 主查询界面的查询构造SQL
+    def main_creatsql(self, keyword):
+        fixd_list = " and 分类 = 'qd'"
+        fixd_norm = " and 分类 = 'de'"
+        fixd_good = " and 分类 = 'cl'"
+        # 此处仅为修正-综合单价一致分析，尚未完善 ' GROUP BY 名称, 特征'
+        dewight = " GROUP BY substr(编码,1,8),名称,特征,单位,单价"
+        dezero = " and 工程量 <> ' ' and 工程量 <> '0'"
+        # 分部写法
+        fenbu_key = self.lineEdit_5.text()
+        fenbu_key = fenbu_key.replace(" ", "%")
+        fenbu = " and 单位工程 like '%" + fenbu_key + "%'"
+        keyword = keyword.replace(" ", "%")
+        sql = ""
+        # 分部判断
+        if self.checkBox_3.checkState() == Qt.CheckState.Checked:
+            sql += fenbu
+        # 去零判断
+        if self.checkBox_6.checkState() == Qt.CheckState.Checked:
+            sql += dezero
+        # 去重判断
+        if self.checkBox_5.checkState() == Qt.CheckState.Checked:
+            sql += dewight
+
+        # 按权重：材料价格、材料、定额、清单
+        condtion1 = self.comboBox.currentText()
+        condtion2 = self.comboBox_2.currentText()
+        # 材料价格
+        if self.radioButton_1.isChecked():
+            self.tableWidget.setHorizontalHeaderItem(6, QTableWidgetItem("材料单价"))
+            keyword = self.sy0bles(keyword[:1]) + keyword[1:]
+            return "select * from 工程表 where 单价 " + keyword + fixd_good + sql
+        # 材料
+        elif self.radioButton.isChecked():
+            self.tableWidget.setHorizontalHeaderItem(6, QTableWidgetItem("材料单价"))
+            return self.SqlCon(condtion1, condtion2, keyword) + fixd_good + sql
+
+        # 定额
+        elif self.radioButton_2.isChecked():
+            self.tableWidget.setHorizontalHeaderItem(6, QTableWidgetItem("综合单价"))
+            return self.SqlCon(condtion1, condtion2, keyword) + fixd_norm + sql
+
+        # 清单
+        elif self.radioButton_6.isChecked():
+            self.tableWidget.setHorizontalHeaderItem(6, QTableWidgetItem("综合单价"))
+            return self.SqlCon(condtion1, condtion2, keyword) + fixd_list + sql
+
+    # 条件选择SQL
+    def SqlCon(self, con1, con2, key):
+        if self.checkBox.checkState() == Qt.CheckState.Checked and self.checkBox_2.checkState() == Qt.CheckState.Checked:
+            sql = "select * from 工程表 where (" + con1 + " like '%" + key + "%' or " + con2 + " like '%" + key + "%')"
+        elif self.checkBox.checkState() == Qt.CheckState.Unchecked and self.checkBox_2.checkState() == Qt.CheckState.Checked:
+            sql = "select * from 工程表 where " + con2 + " like '%" + key + "%'"
+        elif self.checkBox.checkState() == Qt.CheckState.Checked and self.checkBox_2.checkState() == Qt.CheckState.Unchecked:
+            sql = "select * from 工程表 where " + con1 + " like '%" + key + "%'"
+        else:
+            sql = "select * from 工程表 where 名称 like '%" + key + "%'"
+        return sql
+
+    # 单位工程查询构造SQL
+    def single_creatsql(self, sqls, keyword):
+        fixd_list = " and 分类 = 'qd'"
+        fixd_norm = " and 分类 = 'de'"
+        fixd_good = " and 分类 = 'cl'"
+        dezero = " and 工程量 <> ' ' and 工程量 <> '0'"
+        keyword = keyword.replace(" ", "%")
+        sql = ""
+        if self.checkBox_6.checkState() == Qt.CheckState.Checked:
+            sql = dezero
+        # 按权重：材料价格、材料、定额、清单
+        if self.radioButton_4.isChecked():
+            self.tableWidget_6.setHorizontalHeaderItem(6, QTableWidgetItem("材料单价"))
+            return "select * from 工程表 where 单价 ='" + keyword + "'" + fixd_good + sql + sqls
+        elif self.radioButton_3.isChecked():
+            self.tableWidget_6.setHorizontalHeaderItem(6, QTableWidgetItem("材料单价"))
+            return "select * from 工程表 where 名称 like '%" + keyword + "%'" + fixd_good + sql + sqls
+        elif self.radioButton_5.isChecked():
+            self.tableWidget_6.setHorizontalHeaderItem(6, QTableWidgetItem("综合单价"))
+            return "select * from 工程表 where (名称 like '%" + keyword + "%' or 编码 like '%" + keyword + "%')" + fixd_norm + sql + sqls
+        elif self.radioButton_7.isChecked():
+            self.tableWidget_6.setHorizontalHeaderItem(6, QTableWidgetItem("综合单价"))
+            return "select * from 工程表 where 名称 like '%" + keyword + "%'" + fixd_list + sql + sqls
+
+    # 初始化所有的表格初始界面
+    def initTable(self):
+        # 单个查询结果表样式
+        self.tableWidget.setColumnCount(10)
+        self.tableWidget.setHorizontalHeaderLabels(
+            ["单位工程", "清单序号", "编号", "项目名称", "单位", "工程量", "综合单价", "合计合价", "项目特征", "表"])
+        # 单个查询定额明细表样式
+        self.tableWidget_2.setColumnCount(6)
+        self.tableWidget_2.setHorizontalHeaderLabels(
+            ["项目编码", "项目名称", "单位", "工程量", "综合单价", "合计合价"])
+        # 录入数据表格样式
+        self.tableWidget_3.setHorizontalHeaderLabels(
+            ["分类", "同项", "清单号", "单位工程", "分部", "项目号", "编码", "名称", "单位", "工程量", "单价", "合价", "特征", "工作内容"])
+        # 批量查询输入表样式
+        self.tableWidget_4.setColumnCount(3)
+        self.tableWidget_4.setRowCount(1)
+        self.tableWidget_4.setHorizontalHeaderLabels(
+            ["项目名称", "规格", "单价"])
+        # 批量查询结果表样式
+        self.tableWidget_5.setColumnCount(5)
+        self.tableWidget_5.setHorizontalHeaderLabels(
+            ["单位工程", "序号", "项目名称", "单位", "单价"])
+        # 单位工程查询结果表样式
+        self.tableWidget_6.setColumnCount(8)
+        self.tableWidget_6.setHorizontalHeaderLabels(
+            ["分部", "清单序号", "编号", "项目名称", "单位", "工程量", "综合单价", "合计合价"])
+
+        # 单位工程定额明细表样式
+        self.tableWidget_7.setColumnCount(6)
+        self.tableWidget_7.setHorizontalHeaderLabels(
+            ["项目编码", "项目名称", "单位", "工程量", "综合单价", "合计合价"])
+        # 初始化演示表
+        self.tableWidget_8.setColumnCount(4)
+        self.tableWidget_8.setRowCount(5)
+        self.tableWidget_8.setHorizontalHeaderLabels(["项目名称", "规格", "单价", "综合单价"])
+        for i in range(5):
+            for ii in range(4):
+                item = QTableWidgetItem('演示' + str(i) + str(ii))
+                self.tableWidget_8.setItem(i, ii, item)
+
+    # 主查询结果表双击事件-仅读取项目名称到查询窗口
+    def settableWidget_contentorow(self):
+        item = self.tableWidget.currentItem()
+        if item and self.tableWidget.horizontalHeaderItem(self.tableWidget.currentColumn()).text() == '项目名称':
+            self.lineEdit.setText(item.text())
+
+    # 单位查询查询结果表双击事件-仅读取项目名称到查询窗口
+    def settable_contentorow(self):
+        item = self.tableWidget_6.currentItem()
+        if item and self.tableWidget_6.horizontalHeaderItem(self.tableWidget_6.currentColumn()).text() == '项目名称':
+            self.lineEdit_3.setText(item.text())
+
+    # 单清单页面数据汇总
+    def settable_addition(self):
+        if len(self.tableWidget.selectedItems()) > 1:
+            sumn = 0
+            for item in self.tableWidget.selectedItems():
+                if item is not None:
+                    if self.isFloatNum(item.text()):
+                        sumn += float(item.text())
+            if self.checkBox_5.checkState() == Qt.CheckState.Checked:
+                self.statusbar.showMessage("去重模式下合计：" + str(self.format_number(sumn)))
+            else:
+                self.statusbar.showMessage("合计：" + str(self.format_number(sumn)))
+
+    # 定额清单页面数据汇总
+    def settable_singleaddition(self):
+        if len(self.tableWidget_6.selectedItems()) > 1:
+            sumn = 0
+            for item in self.tableWidget_6.selectedItems():
+                if item is not None:
+                    if self.isFloatNum(item.text()):
+                        sumn += float(item.text())
+            self.statusbar.showMessage("合计：" + str(self.format_number(sumn)))
+
+    # 工作内容
+    def sqlite3_conn_content(self):
+        item = self.tableWidget_2.item(self.tableWidget_2.currentRow(), 0)
+        if item is not None:
+            file = self.address + self.name + ".db"
+            if os.path.exists(file):
+                lsts = self.sqlconnect(file, "SELECT 工作内容 FROM 工程表 WHERE 编码 = '" + item.text() + "' or 编码 = '" + "0" + item.text() + "' GROUP BY 工作内容")
+                for lst in lsts:
+                    self.plainTextEdit_5.setPlainText(str(lst[0]))
+
+    # 单位工程工作内容
+    def sqlite3_conn_singlecontent(self):
+        item = self.tableWidget_7.item(self.tableWidget_7.currentRow(), 0)
+        if item is not None:
+            file = self.address + self.single_name + ".db"
+            if os.path.exists(file):
+                lsts = self.sqlconnect(file, "SELECT 工作内容 FROM 工程表 WHERE 编码 = '" + item.text() + "' or 编码 = '" + "0" + item.text() + "' GROUP BY 工作内容")
+                for lst in lsts:
+                    self.plainTextEdit_6.setPlainText(str(lst[0]))
+
+    # 判断是否是浮点数，用于单清单查询汇总——数据检测
+    @staticmethod
+    def isFloatNum(text):
+        try:
+            float(text)
+            return True
+        except ValueError:
+            return False
+
+    # 双击一个项目-切换到单位工程界面-显示当前工程所有的单位工程
+    def wprojectname(self):
+        self.list_pro = []
+        data = self.itemList.currentItem().text()
+        for i in range(self.itemList.count()):
+            self.itemList.item(i).setCheckState(Qt.CheckState.Unchecked)
+        self.itemList.currentItem().setCheckState(Qt.CheckState.Checked)
+        self.single_name = data
+        lsts = self.sqlconnect(self.address + data + '.db', "Select * from 工程表 group by 单位工程")
+        for row in lsts:
+            text = str(row[4])
+            self.list_pro.append(text)
+        self.list_pro = list(set(self.list_pro))
+        self.populate_model(self.list_pro)
+        self.mainContent.setCurrentIndex(2)
+
+    # 双击查看1个单位工程全部的数据
+    def singleprojiect(self, unit_name):
+        file = self.address + self.single_name + ".db"
+        if os.path.exists(file):
+            sql = "select * from 工程表 where 分类 = 'qd' and 单位工程 like '%" + unit_name + "%'"
+            self.tableWidget_6.setRowCount(0)
+            self.tableWidget_6.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+            # 1 分类 2 同项 3 清单号 4 单位工程 5 分部 6 项目号 7 编码 8 名称 9 单位 10 工程量 11 单价 12 合价 13 特征 14 工作内容
+            lsts = self.sqlconnect(file, sql)
+            self.tableWidget_6.setSortingEnabled(False)
+            for row in lsts:
+                self.tableWidget_6.insertRow(self.tableWidget_6.rowCount())
+                inx = self.tableWidget_6.rowCount() - 1
+                text = str(row[5])
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_6.setItem(inx, 0, item)
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, row[3])
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_6.setItem(inx, 1, item)
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, row[2])
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_6.setItem(inx, 2, item)
+                self.tableWidget_6.setItem(inx, 3, QTableWidgetItem(str(row[8])))
+                item = QTableWidgetItem(str(row[9]))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_6.setItem(inx, 4, item)
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, row[10])
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_6.setItem(inx, 5, item)
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, row[11])
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_6.setItem(inx, 6, item)
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, row[12])
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_6.setItem(inx, 7, item)
+            self.tableWidget_6.setSortingEnabled(True)
+
+    # 单位工程查询界面-查询关键字按回车查询结果
+    def projectname_find(self, text):
+        pattern = text.replace(' ', '.*?')
+        if text =="":
+            self.populate_model(self.list_pro)
+        else:
+            filtered_list = [item for item in self.list_pro if len(re.findall(pattern, str(item))) > 0]
+            self.populate_model(filtered_list)
+        self.tree_view.expandAll()
+
+    # 批量查询分支-分为模糊和精确
+    def batchquery(self):
+        list_projiect = []
+        for i in range(self.itemList.count()):
+            if self.itemList.item(i).checkState() == Qt.CheckState.Checked:
+                list_projiect.append(self.itemList.item(i).text())
+        if len(list_projiect) > 0:
+            if self.checkBox_31.checkState() == Qt.CheckState.Checked:
+                self.bacthquery_vague(list_projiect)
+            else:
+                self.batchquery_exact(list_projiect)
+
+    # 批量查询清单或材料（模糊版本）
+    def bacthquery_vague(self, list_projiectname):
+        self.tableWidget_5.setRowCount(0)
+        # self.checkBox_9.setCheckState(Qt.CheckState.Checked)
+        for i in range(self.tableWidget_4.rowCount()):
+            item = self.tableWidget_4.item(i, 0)
+            if item is not None:
+                name = item.text()
+                name = name.replace(' ', '%')
+                item = self.tableWidget_4.item(i, 1)
+                if item is None:
+                    size = ""
+                else:
+                    size = item.text()
+                    if size.replace(" ", "") == "":
+                        size = ""
+                if self.checkBox_7.checkState() == Qt.CheckState.Checked:
+                    if size != "":
+                        size = size.replace(' ', '%')
+                        sql = "select * from 工程表 where 名称 like '%" + name + "%" + size + "%' and 分类 = 'cl'"
+                    else:
+                        sql = "select * from 工程表 where 名称 like '%" + name + "%' and 分类 = 'cl'"
+                else:
+                    sql = "select * from 工程表 where 名称 like '%" + name + "%' and 分类 = 'qd'"
+                list_price = []
+                if self.checkBox_9.checkState() == Qt.CheckState.Checked:
+                    self.tableWidget_5.insertRow(self.tableWidget_5.rowCount())
+                    inx = self.tableWidget_5.rowCount() - 1
+                    name = name.replace('%', ' ')
+                    if self.checkBox_7.checkState() == Qt.CheckState.Checked:
+                        if size == "":
+                            item = QTableWidgetItem(name)
+                        else:
+                            item = QTableWidgetItem(name + " " + size)
+                    else:
+                        item = QTableWidgetItem(name)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                    self.tableWidget_5.setItem(inx, 0, item)
+                    self.tableWidget_5.setSpan(inx, 0, 1, self.tableWidget_5.columnCount())
+
+                for ii in range(len(list_projiectname)):
+                    file = self.address + list_projiectname[ii] + ".db"
+                    if os.path.exists(file):
+                        lsts = self.sqlconnect(file, sql)
+                        for row in lsts:
+                            if self.checkBox_9.checkState() == Qt.CheckState.Checked:
+                                self.tableWidget_5.insertRow(self.tableWidget_5.rowCount())
+                                inx = self.tableWidget_5.rowCount() - 1
+                                text = str(row[4]) + '\\' + str(row[5])
+                                text = list_projiectname[ii] + "\\" + text
+                                self.tableWidget_5.setItem(inx, 0, QTableWidgetItem(text))
+                                item = QTableWidgetItem(str(row[3]))
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                                self.tableWidget_5.setItem(inx, 1, item)
+                                self.tableWidget_5.setItem(inx, 2, QTableWidgetItem(str(row[8])))
+                                item = QTableWidgetItem(str(row[9]))
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                                self.tableWidget_5.setItem(inx, 3, item)
+                                item = QTableWidgetItem(str(row[11]))
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                                self.tableWidget_5.setItem(inx, 4, item)
+                            list_price.append(str(row[11]))
+                        self.reConment(self.tableWidget_5)
+                        self.tableWidget_5.setItemDelegate(QtWidgets.QItemDelegate())
+                list_price = list(set(list_price))
+                self.batch_search_result_show(list_price, i)
+
+    # 批量查询清单或材料（精确版本）
+    def batchquery_exact(self, list_projiectname):
+        self.tableWidget_5.setRowCount(0)
+        for i in range(self.tableWidget_4.rowCount()):
+            item = self.tableWidget_4.item(i, 0)
+            if item is not None:
+                name = item.text()
+                item = self.tableWidget_4.item(i, 1)
+                if item is None:
+                    size = ""
+                else:
+                    size = item.text()
+                    if size.replace(" ", "") == "":
+                        size = ""
+                # 批量查材料
+                if self.checkBox_7.checkState() == Qt.CheckState.Checked:
+                    if size != "":
+                        sql = "select * from 工程表 where 名称 = '" + name + " " + size + "' and 分类 = 'cl'"
+                    else:
+                        sql = "select * from 工程表 where 名称 = '" + name + "' and 分类 = 'cl'"
+                else:
+                    sql = "select * from 工程表 where 名称 = '" + name + "' and 分类 = 'qd'"
+                list_price = []
+                # 反查开关打开-添加批量查询明细结果的抬头行
+                if self.checkBox_9.checkState() == Qt.CheckState.Checked:
+                    self.tableWidget_5.insertRow(self.tableWidget_5.rowCount())
+                    inx = self.tableWidget_5.rowCount() - 1
+                    # 勾选材料
+                    if self.checkBox_7.checkState() == Qt.CheckState.Checked:
+                        if size == "":
+                            item = QTableWidgetItem(name)
+                        else:
+                            item = QTableWidgetItem(name + " " + size)
+                    else:
+                        item = QTableWidgetItem(name)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                    self.tableWidget_5.setItem(inx, 0, item)
+                    self.tableWidget_5.setSpan(inx, 0, 1, self.tableWidget_5.columnCount())
+                for ii in range(len(list_projiectname)):
+                    file = self.address + list_projiectname[ii] + ".db"
+                    if os.path.exists(file):
+                        lsts = self.sqlconnect(file, sql)
+                        for row in lsts:
+                            if self.checkBox_9.checkState() == Qt.CheckState.Checked:
+                                self.tableWidget_5.insertRow(self.tableWidget_5.rowCount())
+                                inx = self.tableWidget_5.rowCount() - 1
+                                text = str(row[4]) + '\\' + str(row[5])
+                                text = list_projiectname[ii] + "\\" + text
+                                self.tableWidget_5.setItem(inx, 0, QTableWidgetItem(text))
+                                item = QTableWidgetItem(str(row[3]))
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                                self.tableWidget_5.setItem(inx, 1, item)
+                                self.tableWidget_5.setItem(inx, 2, QTableWidgetItem(str(row[8])))
+                                item = QTableWidgetItem(str(row[9]))
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                                self.tableWidget_5.setItem(inx, 3, item)
+                                item = QTableWidgetItem(str(row[11]))
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                                self.tableWidget_5.setItem(inx, 4, item)
+                            list_price.append(str(row[11]))
+                list_price = list(set(list_price))
+                self.batch_search_result_show(list_price, i)
+
+    # 批量查询结果输出
+    def batch_search_result_show(self, list_price: list, i: int):
+        if len(list_price) > 1:
+            if self.checkBox_8.checkState() == Qt.CheckState.Checked:
+                list_price = list(map(float, list_price))
+                text = str('{:.2f}'.format(sum(list_price) / len(list_price)))
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                item.setForeground(Qt.GlobalColor.red)
+                self.tableWidget_4.setItem(i, self.tableWidget_4.columnCount() - 1, QTableWidgetItem(item))
+            else:
+                item = QTableWidgetItem(str('/'.join(list_price)))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                self.tableWidget_4.setItem(i, self.tableWidget_4.columnCount() - 1, item)
+        elif len(list_price) == 1:
+            item = QTableWidgetItem(str(list_price[0]))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            self.tableWidget_4.setItem(i, self.tableWidget_4.columnCount() - 1, QTableWidgetItem(item))
+        else:
+            item = QTableWidgetItem("无")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            item.setForeground(Qt.GlobalColor.lightGray)
+            self.tableWidget_4.setItem(i, self.tableWidget_4.columnCount() - 1, QTableWidgetItem(item))
+            if self.checkBox_9.checkState() == Qt.CheckState.Checked:
+                self.tableWidget_5.removeRow(self.tableWidget_5.rowCount() - 1)
+        self.tableWidget_5.setItemDelegate(QtWidgets.QItemDelegate())
+        self.reConment(self.tableWidget_5)
+
+    # 批量查询-点击结果查看位置-状态栏
+    def batchClick(self):
+        item = self.tableWidget_5.item(self.tableWidget_5.currentRow(), 0)
+        if item is not None:
+            single = item.text()
+            item = self.tableWidget_5.item(self.tableWidget_5.currentRow(), 1)
+            if item is not None:
+                ids = item.text()
+                self.statusbar.showMessage("当前位置：" + single + " 第" + ids + "项", 0)
+            else:
+                self.statusbar.showMessage("", 0)
+
+    # 批量查询-反查开关
+    def chekedetail(self):
+        # 反查开关打开
+        if self.checkBox_9.checkState() == Qt.CheckState.Checked:
+            item = self.tableWidget_4.item(self.tableWidget_4.currentRow(), 0)
+            if item is not None:
+                text = item.text()
+                # 材料价格查询勾选
+                if self.checkBox_7.checkState() == Qt.CheckState.Checked:
+                    item = self.tableWidget_4.item(self.tableWidget_4.currentRow(), 1)
+                    if item is not None:
+                        size = item.text()
+                        if size.replace(" ", "") != "":
+                            text = text + " " + size
+                for i in range(self.tableWidget_5.rowCount()):
+                    item = self.tableWidget_5.item(i, 0)
+                    if item.text() == text:
+                        self.tableWidget_5.verticalScrollBar().setSliderPosition(i)
+                        item.setBackground(QColor(215, 224, 234))
+                        item.setForeground(Qt.GlobalColor.red)
+                    else:
+                        item.setBackground(Qt.GlobalColor.white)
+                        item.setForeground(Qt.GlobalColor.black)
+
+    # 批量查询-数据粘贴界面 复制查询结果列
+    def copyprice(self):
+        self.tableWidget_4.setCurrentCell(0, 2)
+        selection = QTableWidgetSelectionRange(0, 2, self.tableWidget_4.rowCount() - 1, 2)
+        self.tableWidget_4.setRangeSelected(selection, True)
+        self.tableWidget_4.copy_selection()
+
+    # 批量查询-数据粘贴界面 清空数据
+    def empthelist(self):
+        self.tableWidget_4.setRowCount(0)
+        self.tableWidget_4.setRowCount(1)
+
+    # 关闭保存
+    def closeEvent(self, e):
+        self.saveSetting()
+
+    # 重置行高
+    def reConment(self, table: MytableWidget):
+        if self.checkBox_19.checkState() == Qt.CheckState.Checked:
+            table.resizeRowsToContents()
+
+    # 加载设置
+    def loadSetting(self):
+        # 自动换行
+        if self.settings.value('check_box_19', 1, int) == 1:
+            self.checkBox_19.setCheckState(Qt.CheckState.Checked)
+        else:
+            self.checkBox_19.setCheckState(Qt.CheckState.Unchecked)
+
+        # 信息价期数
+        if self.settings.value('check_box_21', 1, int) == 1:
+            self.checkBox_21.setCheckState(Qt.CheckState.Checked)
+            self.splitter_11.setSizes([0, 1])
+        else:
+            self.checkBox_21.setCheckState(Qt.CheckState.Unchecked)
+
+        # 恢复窗体的位置和大小(重启生效)
+        self.restoreState(self.settings.value('state', QByteArray()))
+        self.restoreGeometry(self.settings.value('geometry', QByteArray()))
+
+        # 恢复分隔条的位置（重启生效）
+        self.splitter.restoreState(self.settings.value('splitter_1', QByteArray()))
+        self.splitter_3.restoreState(self.settings.value('splitter_3', QByteArray()))
+        self.splitter_4.restoreState(self.settings.value('splitter_4', QByteArray()))
+        self.splitter_5.restoreState(self.settings.value('splitter_5', QByteArray()))
+        self.splitter_6.restoreState(self.settings.value('splitter_6', QByteArray()))
+        self.splitter_7.restoreState(self.settings.value('splitter_7', QByteArray()))
+        self.splitter_9.restoreState(self.settings.value('splitter_9', QByteArray()))
+        self.splitter_10.restoreState(self.settings.value('splitter_10', QByteArray()))
+        if self.settings.value('check_box_21', 0, int) == 0:
+            self.splitter_11.restoreState(self.settings.value('splitter_11', QByteArray()))
+
+        # 分隔条2单独配置
+        self.splitter_2.setSizes([int(x) for x in self.settings.value('splitter_2_size', defaultValue=[100, 100], type=list)])
+
+        # 恢复表格的整体样式
+        self.tableWidget.horizontalHeader().restoreState(self.settings.value('table1_location', QByteArray()))
+        self.tableWidget_2.horizontalHeader().restoreState(self.settings.value('table2_location', QByteArray()))
+        self.tableWidget_3.horizontalHeader().restoreState(self.settings.value('table3_location', QByteArray()))
+        self.tableWidget_4.horizontalHeader().restoreState(self.settings.value('table4_location', QByteArray()))
+        self.tableWidget_5.horizontalHeader().restoreState(self.settings.value('table5_location', QByteArray()))
+        self.tableWidget_6.horizontalHeader().restoreState(self.settings.value('table6_location', QByteArray()))
+        self.tableWidget_7.horizontalHeader().restoreState(self.settings.value('table7_location', QByteArray()))
+        self.tableWidget_xxj.horizontalHeader().restoreState(self.settings.value('table8_location', QByteArray()))
+
+        # 恢复界面的初始化效果内容
+        self.spinBox_5.setValue(self.settings.value('itemlist_height', 28, int))
+        self.spinBox_6.setValue(self.settings.value('itemlist2_height', 28, int))
+        self.spinBox.setValue(self.settings.value('text_size', 18, int))
+        self.spinBox_2.setValue(self.settings.value('list1_size', 15, int))
+        self.spinBox_3.setValue(self.settings.value('list2_size', 15, int))
+        self.spinBox_4.setValue(self.settings.value('table_size', 11, int))
+        refont = QFont()
+        refont.setFamily(self.settings.value('text_type', 'Microsoft YaHei UI', str))
+        self.fontComboBox.setCurrentFont(refont)
+        refont.setFamily(self.settings.value('list1_type', 'Microsoft YaHei UI', str))
+        self.fontComboBox_2.setCurrentFont(refont)
+        refont.setFamily(self.settings.value('list2_type', 'Microsoft YaHei UI', str))
+        self.fontComboBox_3.setCurrentFont(refont)
+        refont.setFamily(self.settings.value('table_type', 'Microsoft YaHei UI', str))
+        self.fontComboBox_4.setCurrentFont(refont)
+
+        # 主题
+        theme = self.settings.value('theme', 'auto', str)
+        if theme == 'auto':
+            self.radioButton_8.setChecked(True)
+        elif theme == 'dark':
+            self.radioButton_9.setChecked(True)
+        else:
+            self.radioButton_10.setChecked(True)
+
+        xxj = self.settings.value('xxjtype', 'N9', str)
+        if xxj == 'N9':
+            self.radio_N9.setChecked(True)
+        else:
+            self.radio_N10.setChecked(True)
+
+        # 数据库地址
+        self.N9lineEdite.setText(self.settings.value('N9_address', '', str))
+        self.N10lineEdite.setText(self.settings.value('N10_address','', str))
+
+    # 保存设置
+    def saveSetting(self):
+        # 自动换行
+        if self.checkBox_19.checkState() == Qt.CheckState.Checked:
+            self.settings.setValue('check_box_19', 1)
+        else:
+            self.settings.setValue('check_box_19', 0)
+
+        # 自动换行
+        if self.checkBox_21.checkState() == Qt.CheckState.Checked:
+            self.settings.setValue('check_box_21', 1)
+        else:
+            self.settings.setValue('check_box_21', 0)
+
+        # 窗体的位置、大小记录
+        self.settings.setValue('geometry', self.saveGeometry())
+        self.settings.setValue('state', self.saveState())
+        # 保存分隔条
+        self.settings.setValue('splitter_1', self.splitter.saveState())
+        self.settings.setValue('splitter_3', self.splitter_3.saveState())
+        self.settings.setValue('splitter_4', self.splitter_4.saveState())
+        self.settings.setValue('splitter_5', self.splitter_5.saveState())
+        self.settings.setValue('splitter_6', self.splitter_6.saveState())
+        self.settings.setValue('splitter_7', self.splitter_7.saveState())
+        self.settings.setValue('splitter_9', self.splitter_9.saveState())
+        self.settings.setValue('splitter_10', self.splitter_10.saveState())
+        if not self.checkBox_21.isChecked():
+            self.settings.setValue('splitter_11', self.splitter_11.saveState())
+
+        # 分隔条2单独配置
+        self.settings.setValue('splitter_2_size', self.splitter_2.sizes())
+        self.settings.setValue('splitter_2_order', self.itemlistlocation)
+
+        # 行高
+        self.settings.setValue('itemlist_height', self.spinBox_5.value())
+        self.settings.setValue('itemlist2_height', self.spinBox_6.value())
+        self.settings.setValue('text_size', self.spinBox.value())
+        self.settings.setValue('text_type', self.fontComboBox.currentFont().family())
+        self.settings.setValue('list1_size', self.spinBox_2.value())
+        self.settings.setValue('list1_type', self.fontComboBox_2.currentFont().family())
+        self.settings.setValue('list2_size', self.spinBox_3.value())
+        self.settings.setValue('list2_type', self.fontComboBox_3.currentFont().family())
+        self.settings.setValue('table_size', self.spinBox_4.value())
+        self.settings.setValue('table_type', self.fontComboBox_4.currentFont().family())
+        # 保存表格列宽
+        self.tableWidget.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.tableWidget_2.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.tableWidget_3.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.tableWidget_4.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.tableWidget_5.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.tableWidget_6.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.tableWidget_7.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.tableWidget_xxj.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.settings.setValue('table1_location', self.tableWidget.horizontalHeader().saveState())
+        self.settings.setValue('table2_location', self.tableWidget_2.horizontalHeader().saveState())
+        self.settings.setValue('table3_location', self.tableWidget_3.horizontalHeader().saveState())
+        self.settings.setValue('table4_location', self.tableWidget_4.horizontalHeader().saveState())
+        self.settings.setValue('table5_location', self.tableWidget_5.horizontalHeader().saveState())
+        self.settings.setValue('table6_location', self.tableWidget_6.horizontalHeader().saveState())
+        self.settings.setValue('table7_location', self.tableWidget_7.horizontalHeader().saveState())
+        self.settings.setValue('table8_location', self.tableWidget_xxj.horizontalHeader().saveState())
+
+        # 2. 主题的记录
+        if self.radioButton_8.isChecked():
+            self.settings.setValue('theme', self.radioButton_8.text())
+        if self.radioButton_9.isChecked():
+            self.settings.setValue('theme', self.radioButton_9.text())
+        if self.radioButton_10.isChecked():
+            self.settings.setValue('theme', self.radioButton_10.text())
+
+        # 3. 信息价数据库地址记录
+        self.settings.setValue('N9_address', self.N9lineEdite.text())
+        self.settings.setValue('N10_address', self.N10lineEdite.text())
+
+        if self.radio_N9.isChecked():
+            self.settings.setValue('xxjtype', 'N9')
+        if self.radio_N10.isChecked():
+            self.settings.setValue('xxjtype', 'N10')
+
+    # 修改实时反馈-样式表的结果显示修改后的结果
+    # 目录表的表格间距
+    def lstheightadjust(self):
+        for i in range(self.listWidget.count()):
+            self.listWidget.item(i).setSizeHint(QSize(self.listWidget.width(), self.spinBox_5.value()))
+        for i in range(self.itemList.count()):
+            self.itemList.item(i).setSizeHint(QSize(self.itemList.width(), self.spinBox_5.value()))
+
+    # 目录表的表格字体大小
+    def lstfontadjust(self):
+        font = QFont()
+        font.setPixelSize(self.spinBox_2.value())
+        font.setFamily(self.fontComboBox_2.currentFont().family())
+        self.listWidget.setFont(font)
+        self.itemList.setFont(font)
+        self.tree_view.setFont(font)
+
+    # 项目特征和工作内容的字体大小
+    def textfontadjust(self):
+        font = QFont()
+        font.setPixelSize(self.spinBox.value())
+        font.setFamily(self.fontComboBox.currentFont().family())
+        self.plainTextEdit_3.setFont(font)
+        self.plainTextEdit.setFont(font)
+        self.plainTextEdit_2.setFont(font)
+
+    # 表格的字体大小和样式
+    def tablefontadjust(self):
+        font = QFont()
+        font.setPixelSize(self.spinBox_4.value())
+        font.setFamily(self.fontComboBox_4.currentFont().family())
+        self.tableWidget_8.setFont(font)
+        self.tableWidget.setFont(font)
+        self.tableWidget_7.setFont(font)
+        self.tableWidget_2.setFont(font)
+        self.tableWidget_3.setFont(font)
+        self.tableWidget_4.setFont(font)
+        self.tableWidget_5.setFont(font)
+        self.tableWidget_6.setFont(font)
+
+    # 表格到元组
+    @staticmethod
+    def from_xlsx_to_tuple(file_path: str):
+        xls = pd.ExcelFile(file_path)
+        dataframes = {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
+        import_xlsxs = []
+        for sheet, df in dataframes.items():
+            singname = str(df.iloc[0, 0])
+            singname = singname[singname.find('\\') + 1:]
+            df = df.iloc[2:]
+            df_filled = df.fillna(" ")
+            for row in df_filled.itertuples(index=False):
+                import_xlsx = [singname, ""]
+                import_xlsx.extend(list(row))
+                import_xlsxs.append(import_xlsx)
+        return import_xlsxs
+
+    # 打开表格
+    def openxls(self):
+        filePath, filetype = QFileDialog.getOpenFileName(self, '请选择导出的数据表格：', filter='*.xls*')
+        self.lineEdit_2.setText(filePath)
+        if filePath != '':
+            # 将xls转换成xlsx
+            if filePath.find('xlsx') < 0:
+                filePath = filePath.replace("/", "\\")
+                xls_data = pd.read_excel(filePath, sheet_name=None)
+                xlsx_file = filePath.replace('xls', 'xlsx')
+                with pd.ExcelWriter(xlsx_file, engine='openpyxl') as writer:
+                    # 将每个工作表写入新的.xlsx文件
+                    for sheet_name, df in xls_data.items():
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                os.remove(filePath)
+                self.lineEdit_2.setText(xlsx_file)
+            # pd 导入4s
+            import_xlsxs = self.from_xlsx_to_tuple(self.lineEdit_2.text())
+            self.tableWidget_3.setRowCount(0)
+            for cells in import_xlsxs:
+                self.tableWidget_3.insertRow(self.tableWidget_3.rowCount())
+                inx = self.tableWidget_3.rowCount() - 1
+                for j, cell in enumerate(cells):
+                    item = QTableWidgetItem(str(cell))
+                    self.tableWidget_3.setItem(inx, j + 3, item)
+            self.xlsanays()
+            s = self.lineEdit_2.text()
+            s = s[s.rfind('\\') + 1:]
+            s = s[s.rfind('/') + 1:]
+            s = s.replace('.xlsx', '')
+            self.createlstdb(s)
+
+    # 打开cjz控制价
+    def opencjz(self):
+        filePath, filetype = QFileDialog.getOpenFileName(self, '请选择带组价的cjz文件：', filter='*.cjz')
+        self.lineEdit_2.setText(filePath)
+        if filePath != '':
+            self.tempfile = tempfile.TemporaryDirectory()
+            fileData = self.tempfile.name + "\\"
+            self.unzip_file(filePath, fileData)
+            os.rename(fileData + "Project", fileData + "Project.xml")
+            # 获取清单类型
+            tree = ET.parse(self.tempfile.name + "\\" + "Project.xml")
+            root = tree.getroot()
+            lst_type = 3
+            for item in root.iter('建设项目'):
+                lst_type = item.get('数据类型')
+            # 判断是否是带组价的清单，等下再补充完整
+            # 7 结算 3 清单 4 控制价 5 不带组价控制价 6 投标价
+            if lst_type in ['6', '4', '7']:
+                self.tableWidget_3.setRowCount(0)
+                # 获取结构树，目的是更改文件名称xml
+                tree = ET.parse(fileData + "Project.xml")
+                root = tree.getroot()
+                for items in root.iter('工程数据结构'):
+                    self.find_unit_names(items, fileData)
+                xlm_adress_lsts = []
+                for fileName in os.listdir(fileData):
+                    xlm_adress_lst = []
+                    if fileName.find("xml") != -1 and fileName != 'Project.xml':
+                        xlm_adress_lst.append(fileName)
+                        xlm_adress_lst.append(fileData + fileName)
+                        xlm_adress_lsts.append(xlm_adress_lst)
+                for items in xlm_adress_lsts:
+                    tree = ET.parse(items[1])
+                    root = tree.getroot()
+                    name = items[0].replace('.xml', '')
+                    rows = self.tableWidget_3.rowCount()
+                    info = 1
+                    for item in root.iter('分部分项清单'):
+                        self.w_lst_data(item, name, root)
+                    for i in range(self.tableWidget_3.rowCount() - rows):
+                        item = self.tableWidget_3.item(i + rows, 5)
+                        if item is not None:
+                            item.setText(str(info))
+                            info += 1
+                    info = len(list(root.iter('总价措施清单表'))[0].findall('./*')) + 1
+                    rows = self.tableWidget_3.rowCount()
+                    for item in root.iter('单价措施清单表'):
+                        self.w_lst2_data(item, name, root)
+                    for i in range(self.tableWidget_3.rowCount() - rows):
+                        item = self.tableWidget_3.item(i + rows, 5)
+                        if item is not None:
+                            item.setText(str(info))
+                            info += 1
+                # 清理缓存
+                self.tempfile.cleanup()
+                self.cjzanays()
+                s = self.lineEdit_2.text()
+                s = s[s.rfind('/') + 1:].lower()
+                s = s.replace('.cjz', '')
+                s += '投标价' if lst_type == '6' else '控制价' if lst_type == '4' else '结算价'
+                self.createlstdb(s)
+            else:
+                self.mbox = QMessageBox(self)
+                self.mbox.information(self, '提示！', '只支持控制价、投标价、结算价cjz')
+
+    # 录入分部分项清单数据过程
+    def w_lst_data(self, element, name, root, paragraph=''):
+        for child in element:
+            if child.tag == '清单分部':
+                paragraph = child.get('项目名称')
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '清单项目':
+                self.tableWidget_3.insertRow(self.tableWidget_3.rowCount())
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 3, QTableWidgetItem(name))
+                self.tableWidget_3.setItem(inx, 4, QTableWidgetItem(paragraph))
+                self.tableWidget_3.setItem(inx, 5, QTableWidgetItem(child.get('费用类别')))
+                self.tableWidget_3.setItem(inx, 6, QTableWidgetItem(child.get('项目编码')))
+                self.tableWidget_3.setItem(inx, 7, QTableWidgetItem(child.get('项目名称')))
+                self.tableWidget_3.setItem(inx, 8, QTableWidgetItem(child.get('计量单位')))
+                self.tableWidget_3.setItem(inx, 9, QTableWidgetItem(child.get('工程量')))
+                self.tableWidget_3.setItem(inx, 10, QTableWidgetItem(child.get('综合单价')))
+                self.tableWidget_3.setItem(inx, 11, QTableWidgetItem(child.get('综合合价')))
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '项目特征':
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '特征明细':
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 12, QTableWidgetItem(child.get('内容')))
+            elif child.tag == '工作内容':
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '内容明细':
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 13, QTableWidgetItem(child.get('内容')))
+            elif child.tag == '组价内容':
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '定额子目':
+                self.tableWidget_3.insertRow(self.tableWidget_3.rowCount())
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 3, QTableWidgetItem(name))
+                self.tableWidget_3.setItem(inx, 4, QTableWidgetItem(paragraph))
+                self.tableWidget_3.setItem(inx, 6, QTableWidgetItem(child.get('定额编号')))
+                self.tableWidget_3.setItem(inx, 7, QTableWidgetItem(child.get('项目名称')))
+                self.tableWidget_3.setItem(inx, 8, QTableWidgetItem(child.get('计量单位')))
+                self.tableWidget_3.setItem(inx, 9, QTableWidgetItem(child.get('工程量')))
+                self.tableWidget_3.setItem(inx, 10, QTableWidgetItem(child.get('综合单价')))
+                self.tableWidget_3.setItem(inx, 11, QTableWidgetItem(child.get('综合合价')))
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '工料机组成':
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '工料机含量':
+                self.tableWidget_3.insertRow(self.tableWidget_3.rowCount())
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 3, QTableWidgetItem(name))
+                self.tableWidget_3.setItem(inx, 4, QTableWidgetItem(paragraph))
+                self.tableWidget_3.setItem(inx, 9, QTableWidgetItem(child.get('数量')))
+                pp = self.get_materil(child.get('关联材料代码'), root, inx)
+                self.tableWidget_3.setItem(inx, 11, QTableWidgetItem(str(round(float(child.get('数量')) * float(pp), 2))))
+
+    # 录入单价措施项目清单过程
+    def w_lst2_data(self, element, name, root, paragraph=''):
+        for child in element:
+            if child.tag == '措施分部':
+                paragraph = child.get('项目名称')
+                self.w_lst2_data(child, name, root, paragraph)
+            elif child.tag == '措施清单项目':
+                self.tableWidget_3.insertRow(self.tableWidget_3.rowCount())
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 3, QTableWidgetItem(name))
+                self.tableWidget_3.setItem(inx, 4, QTableWidgetItem(paragraph))
+                self.tableWidget_3.setItem(inx, 5, QTableWidgetItem(child.get('费用类别')))
+                self.tableWidget_3.setItem(inx, 6, QTableWidgetItem(child.get('项目编码')))
+                self.tableWidget_3.setItem(inx, 7, QTableWidgetItem(child.get('项目名称')))
+                self.tableWidget_3.setItem(inx, 8, QTableWidgetItem(child.get('计量单位')))
+                self.tableWidget_3.setItem(inx, 9, QTableWidgetItem(child.get('工程量')))
+                self.tableWidget_3.setItem(inx, 10, QTableWidgetItem(child.get('综合单价')))
+                self.tableWidget_3.setItem(inx, 11, QTableWidgetItem(child.get('综合合价')))
+                self.w_lst2_data(child, name, root, paragraph)
+            elif child.tag == '项目特征':
+                self.w_lst2_data(child, name, root, paragraph)
+            elif child.tag == '特征明细':
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 12, QTableWidgetItem(child.get('内容')))
+            elif child.tag == '工作内容':
+                self.w_lst_data(child, name, root, paragraph)
+            elif child.tag == '内容明细':
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 13, QTableWidgetItem(child.get('内容')))
+            elif child.tag == '组价内容':
+                self.w_lst2_data(child, name, root, paragraph)
+            elif child.tag == '定额子目':
+                self.tableWidget_3.insertRow(self.tableWidget_3.rowCount())
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 3, QTableWidgetItem(name))
+                self.tableWidget_3.setItem(inx, 4, QTableWidgetItem(paragraph))
+                self.tableWidget_3.setItem(inx, 6, QTableWidgetItem(child.get('定额编号')))
+                self.tableWidget_3.setItem(inx, 7, QTableWidgetItem(child.get('项目名称')))
+                self.tableWidget_3.setItem(inx, 8, QTableWidgetItem(child.get('计量单位')))
+                self.tableWidget_3.setItem(inx, 9, QTableWidgetItem(child.get('工程量')))
+                self.tableWidget_3.setItem(inx, 10, QTableWidgetItem(child.get('综合单价')))
+                self.tableWidget_3.setItem(inx, 11, QTableWidgetItem(child.get('综合合价')))
+                self.w_lst2_data(child, name, root, paragraph)
+            elif child.tag == '工料机组成':
+                self.w_lst2_data(child, name, root, paragraph)
+            elif child.tag == '工料机含量':
+                self.tableWidget_3.insertRow(self.tableWidget_3.rowCount())
+                inx = self.tableWidget_3.rowCount() - 1
+                self.tableWidget_3.setItem(inx, 3, QTableWidgetItem(name))
+                self.tableWidget_3.setItem(inx, 4, QTableWidgetItem(paragraph))
+                self.tableWidget_3.setItem(inx, 9, QTableWidgetItem(child.get('数量')))
+                pp = self.get_materil(child.get('关联材料代码'), root, inx)
+                self.tableWidget_3.setItem(inx, 11, QTableWidgetItem(str(round(float(child.get('数量')) * float(pp), 2))))
+
+    # 录入工料机过程
+    def get_materil(self, code, root, row):
+        for item in root.iter('工料机明细'):
+            if item.get('代码') == code:
+                self.tableWidget_3.setItem(row, 7, QTableWidgetItem(item.get('材料名称') + ' ' + item.get('规格型号')))
+                self.tableWidget_3.setItem(row, 8, QTableWidgetItem(item.get('单位')))
+                self.tableWidget_3.setItem(row, 10, QTableWidgetItem(item.get('材料单价')))
+                return item.get('材料单价')
+
+    # 对导入的cjz进行数据处理
+    def cjzanays(self):
+        # 填充空白
+        for row in range(self.tableWidget_3.rowCount()):
+            for col in range(self.tableWidget_3.columnCount()):
+                if self.tableWidget_3.item(row, col) is None:
+                    self.tableWidget_3.setItem(row, col, QTableWidgetItem(' '))
+        # 添加同项区分
+        k = 0
+        i = 0
+        ids = ''
+        while k < self.tableWidget_3.rowCount():
+            item = self.tableWidget_3.item(k, 5)
+            if item.text() != " ":
+                ids = item.text()
+                i += 1
+                self.tableWidget_3.setItem(k, 0, QTableWidgetItem('qd'))
+            else:
+                if self.tableWidget_3.item(k, 6).text() != ' ':
+                    self.tableWidget_3.setItem(k, 0, QTableWidgetItem('de'))
+                else:
+                    self.tableWidget_3.setItem(k, 0, QTableWidgetItem('cl'))
+            self.tableWidget_3.setItem(k, 1, QTableWidgetItem(str(i)))
+            self.tableWidget_3.setItem(k, 2, QTableWidgetItem(str(ids)))
+            k += 1
+
+    # 对导入的表格进行数据处理
+    def xlsanays(self):
+        # 摘除分部
+        k = 0
+        pra = " "
+        while k < self.tableWidget_3.rowCount():
+            if self.tableWidget_3.item(k, 8).text() == " " or self.tableWidget_3.item(k, 8).text() == "":
+                if self.tableWidget_3.item(k, 7).text() == " " or self.tableWidget_3.item(k, 7).text() == "":
+                    self.tableWidget_3.removeRow(k)
+                else:
+                    pra = self.tableWidget_3.item(k, 7).text()
+                    self.tableWidget_3.removeRow(k)
+            else:
+                self.tableWidget_3.setItem(k, 4, QTableWidgetItem(str(pra)))
+                k += 1
+        # 添加同项区分
+        k = 0
+        i = 0
+        ids = ''
+        while k < self.tableWidget_3.rowCount():
+            item = self.tableWidget_3.item(k, 5)
+            if item.text() != " " and item.text() != "":
+                ids = item.text()
+                i += 1
+                self.tableWidget_3.setItem(k, 0, QTableWidgetItem('qd'))
+            else:
+                if self.tableWidget_3.item(k, 6).text() != ' ' and self.tableWidget_3.item(k, 6).text() != '':
+                    self.tableWidget_3.setItem(k, 0, QTableWidgetItem('de'))
+                else:
+                    self.tableWidget_3.setItem(k, 0, QTableWidgetItem('cl'))
+            self.tableWidget_3.setItem(k, 1, QTableWidgetItem(str(i)))
+            self.tableWidget_3.setItem(k, 2, QTableWidgetItem(str(ids)))
+            k += 1
+
+    # 创建db数据库
+    def createlstdb(self, t):
+        text, ok = QInputDialog.getText(self, '创建工程：', '输入工程名称，尽量简短', QLineEdit.EchoMode.Normal, t)
+        if ok:
+            file = self.address + text + ".db"
+            if not os.path.exists(file):
+                try:
+                    conn = sqlite3.connect(file)
+                    c = conn.cursor()
+                    c.execute('''CREATE TABLE 工程表
+               (序号 INT PRIMARY KEY,
+               分类           TEXT,
+               同项           INT,
+               清单号         INT,
+               单位工程       TEXT,
+               分部          TEXT,
+               项目号         INT,
+               编码          TEXT,
+               名称           TEXT,
+               单位           TEXT,
+               工程量          REAL,
+               单价           REAL,
+               合价           REAL,
+               特征           TEXT,
+               工作内容        TEXT);
+                    ''')
+                    conn.commit()
+                    for i in range(self.tableWidget_3.rowCount()):
+                        sqls = ""
+                        for j in range(self.tableWidget_3.columnCount()):
+                            item = self.tableWidget_3.item(i, j)
+                            if item is None:
+                                text = ' '
+                            else:
+                                text = item.text()
+                                text = text.replace("'", "")
+                            if j == self.tableWidget_3.columnCount() - 1:
+                                sqls = sqls + "'" + text + "'"
+                            else:
+                                sqls = sqls + "'" + text + "',"
+                        c.execute("insert into 工程表 (分类,同项,清单号,单位工程,分部,项目号,编码,名称,单位,工程量,单价,合价,特征,工作内容) values (" + sqls + ")")
+                    conn.commit()
+                    conn.close()
+                    self.itemList.update()
+                except Exception as e:
+                    self.plainTextEdit_4.insertPlainText(str(e))
+                    pass
+            else:
+                self.mbox = QMessageBox(self)
+                self.mbox.information(self, '提示！', '工程文件已存在，请改名！')
+                self.createlstdb(t)
+
+    # 解压文件
+    @staticmethod
+    def unzip_file(zip_file, destination):
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            zip_ref.extractall(destination)
+
+    # cjz解析单位工程名称
+    def find_unit_names(self, element, filedata, prefix=''):
+        for child in element:
+            if child.tag == '单位工程':
+                file_name = self.standername(prefix + '-' + child.get('名称').strip("\n"))
+                os.rename(filedata + child.get('文件名称'), filedata + file_name + '.xml')
+            else:
+                child_prefix = child.get('名称') if prefix == '' else prefix + '-' + child.get('名称')
+                self.find_unit_names(child, filedata, child_prefix)
+
+    # 文件名称规范化
+    @staticmethod
+    def standername(content):
+        unlegal = ['"', '/', ':', '?', '<', '>', '|', '\\', '*']
+        return ''.join(['、' if char in unlegal else char for char in content])
+
+    # 导出表格
+    def exportReport_origin(self):
+        if self.tableWidget_3.rowCount() <= 0:
+            return 0
+        file_name, _ = QtWidgets.QFileDialog.getSaveFileName(self, '保存cjz表格', '', 'Excel Files (*.xlsx)')
+        if file_name:
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)
+            thin_border = Border(left=Side(style='thin'),
+                                 right=Side(style='thin'),
+                                 top=Side(style='thin'),
+                                 bottom=Side(style='thin'))
+            headers = [self.tableWidget_3.horizontalHeaderItem(j).text() for j in range(self.tableWidget_3.columnCount())]
+            ws = wb.create_sheet(title='原始数据')
+            for k, title in enumerate(headers):
+                ws.cell(row=1, column=k + 1).value = title
+                ws.cell(row=1, column=k + 1).border = thin_border
+            for i in range(self.tableWidget_3.rowCount()):
+                for j in range(self.tableWidget_3.columnCount()):
+                    item = self.tableWidget_3.item(i, j)
+                    if item is not None:
+                        ws.cell(row=i + 2, column=j + 1).value = item.text()
+                        ws.cell(row=i + 2, column=j + 1).border = thin_border
+            wb.save(file_name)
+
+    '''树状图目录--相关函数'''
+    # 加载工程列表到树状图
+    def populate_model(self, data_list):
+        """Populate the model with the provided data list."""
+        # Clear existing items in the model
+        self.model.removeRows(0, self.model.rowCount())
+        root_node = self.model.invisibleRootItem()
+
+        for item in data_list:
+            parts = []
+            name = ''
+
+            # Check if the item contains '【' and '】', indicating a special node name
+            if '【' in item and '】' in item:
+                name_start = item.index('【')
+                name_end = item.index('】') + 1
+                name = item[name_start:name_end]
+                path_part = item[:name_start]
+                parts = path_part.split('\\')
+            else:
+                # Split by backslash and take the last part as the name for the leaf node
+                parts = item.split('\\')
+                if len(parts) > 1:
+                    name = parts[-1]
+                    parts = parts[:-1]
+
+            current_level = root_node
+            for part in parts:
+                found_child = None
+                for row in range(current_level.rowCount()):
+                    child = current_level.child(row)
+                    if child.text() == part:
+                        found_child = child
+                        break
+
+                if found_child is None:
+                    new_item = QStandardItem(part)
+                    new_item.setCheckable(True)
+                    new_item.setCheckState(Qt.CheckState.Unchecked)
+                    new_item.setEditable(False)
+                    current_level.appendRow(new_item)
+                    current_level = new_item
+                else:
+                    current_level = found_child
+
+            # Add the leaf node (name)
+            if name:
+                leaf_node = QStandardItem(name)
+                leaf_node.setCheckable(True)
+                leaf_node.setCheckState(Qt.CheckState.Unchecked)
+                leaf_node.setEditable(False)
+                current_level.appendRow(leaf_node)
+
+    # 勾选工程项目相关代码
+    def on_item_changed(self, item):
+        if item.isCheckable():
+            self.update_children_check_state(item)
+
+    # 判断是否是最底层节点
+    @staticmethod
+    def is_leaf(item):
+        return item.rowCount() == 0
+
+    # 迭代选中代码
+    def update_children_check_state(self, parent_item):
+        check_state = parent_item.checkState()
+        for row in range(parent_item.rowCount()):
+            child = parent_item.child(row)
+            child.setCheckState(check_state)
+            self.update_children_check_state(child)
+
+    # 双击查看单位工程
+    def on_double_click(self, index: QModelIndex):
+        item = self.model.itemFromIndex(index)
+        if self.is_leaf(item):
+            self.uncheck_all_items_except(item)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.singleprojiect(self.get_full_path(index))
+
+    # 获取选中的路径
+    def collect_checked_paths(self):
+        root = self.model.invisibleRootItem()
+        stack = [(root, [])]
+        checked_paths = []
+        while stack:
+            item, path = stack.pop()
+            if item != root:
+                current_path = path + [item.text()]
+            else:
+                current_path = path
+
+            if self.is_leaf(item) and item.checkState() == Qt.CheckState.Checked:
+                if len(current_path) > 1:
+                    joined_path = '\\'.join(current_path[:-1]) + current_path[-1]
+                else:
+                    joined_path = ''.join(current_path)
+                joined_path = joined_path.lstrip('\\')
+                checked_paths.append(joined_path)
+
+            for row in range(item.rowCount()):
+                child = item.child(row)
+                stack.append((child, current_path))
+        return checked_paths
+
+    # 获得全路径名称
+    def get_full_path(self, index):
+        item = self.model.itemFromIndex(index)
+        path_parts = []
+        while item and item != self.model.invisibleRootItem():
+            path_parts.append(item.text())
+            item = item.parent()
+        path_parts.reverse()
+        if len(path_parts) > 1:
+            return '\\'.join(path_parts[:-1]) + path_parts[-1]
+        else:
+            return ''.join(path_parts)  # Return the single part or empty string
+
+    # 勾选当前，其余取消选择
+    def uncheck_all_items_except(self, exception_item):
+        def traverse_and_uncheck(item):
+            if item != exception_item:
+                item.setCheckState(Qt.CheckState.Unchecked)
+            for row in range(item.rowCount()):
+                traverse_and_uncheck(item.child(row))
+
+        root = self.model.invisibleRootItem()
+        traverse_and_uncheck(root)
+
+    # 右键菜单
+    def show_context_menu(self, pos):
+        menu = QMenu(self)
+        expand_all_action = QAction("全部展开", self)
+        expand_all_action.triggered.connect(lambda: self.tree_view.expandAll())
+        collapse_all_action = QAction("全部收缩", self)
+        collapse_all_action.triggered.connect(lambda: self.tree_view.collapseAll())
+        expand_to_level_1_action = QAction("展开到1级节点", self)
+        expand_to_level_1_action.triggered.connect(self.expand_to_level_1)
+        select_all_action = QAction("全部选中", self)
+        select_all_action.triggered.connect(self.select_all_items)
+        deselect_all_action = QAction("全部取消", self)
+        deselect_all_action.triggered.connect(self.deselect_all_items)
+        select_same_name_action = QAction("选中同名", self)
+        select_same_name_action.triggered.connect(self.select_same_name_items)
+
+        menu.addAction(expand_all_action)
+        menu.addAction(collapse_all_action)
+        menu.addAction(expand_to_level_1_action)
+        menu.addAction(select_all_action)
+        menu.addAction(deselect_all_action)
+        menu.addAction(select_same_name_action)
+        menu.exec(self.tree_view.viewport().mapToGlobal(pos))
+
+    # 展开到级别1
+    def expand_to_level_1(self):
+        root = self.model.invisibleRootItem()
+        for row in range(root.rowCount()):
+            index = self.model.index(row, 0)
+            self.tree_view.setExpanded(index, True)
+
+    # 全选
+    def select_all_items(self):
+        def traverse_and_select(item):
+            item.setCheckState(Qt.CheckState.Checked)
+            for row in range(item.rowCount()):
+                traverse_and_select(item.child(row))
+        root = self.model.invisibleRootItem()
+        traverse_and_select(root)
+
+    # 全不选
+    def deselect_all_items(self):
+        def traverse_and_deselect(item):
+            item.setCheckState(Qt.CheckState.Unchecked)
+            for row in range(item.rowCount()):
+                traverse_and_deselect(item.child(row))
+        root = self.model.invisibleRootItem()
+        traverse_and_deselect(root)
+
+    # 选择同名
+    def select_same_name_items(self):
+        indexes = self.tree_view.selectedIndexes()
+        if not indexes:
+            return
+        self.deselect_all_items()
+        selected_index = indexes[0]
+        selected_item = self.model.itemFromIndex(selected_index)
+        selected_text = selected_item.text()
+        selected_level = self.get_item_level(selected_index)
+        def traverse_and_select_same_name(item, level):
+            if item.text() == selected_text and level - 1 == selected_level:
+                item.setCheckState(Qt.CheckState.Checked)
+            for row in range(item.rowCount()):
+                child = item.child(row)
+                traverse_and_select_same_name(child, level + 1)
+        root = self.model.invisibleRootItem()
+        traverse_and_select_same_name(root, 0)
+
+    # 去当前节点层级
+    @staticmethod
+    def get_item_level(index):
+        level = 0
+        while index.isValid():
+            index = index.parent()
+            level += 1
+        return level - 1
+
+    # 数字处理
+    @staticmethod
+    def format_number(num):
+        integer_part = int(num)
+        decimal_part = num - integer_part
+
+        if integer_part < 10000:
+            return str(num)  # 直接返回原始数字，包括小数部分
+        elif 10000 <= integer_part < 100000000:
+            # 处理1万到1亿之间的数
+            wan_part = integer_part // 10000
+            remainder = integer_part % 10000
+            formatted_integer = f"{wan_part}万{remainder:04d}"
+        else:
+            # 处理大于等于1亿的数
+            yi_part = integer_part // 100000000
+            remainder = integer_part % 100000000
+            if remainder >= 10000:
+                wan_part = remainder // 10000
+                remainder_wan = remainder % 10000
+                formatted_integer = f"{yi_part}亿{wan_part}万{remainder_wan:04d}"
+            else:
+                formatted_integer = f"{yi_part}亿{remainder:08d}"
+
+        # 合并整数部分和小数部分，确保小数部分原样保留
+        if decimal_part != 0:
+            # 将小数部分转换为字符串并去除 "0." 前缀，同时去掉末尾多余的零
+            decimal_str = ('%.9f' % decimal_part)[1:].rstrip('0').rstrip('.')
+            return f"{formatted_integer}{decimal_str}"
+        else:
+            return formatted_integer
+
+    '''信息价处理代码'''
+
+    # 年份选择调整
+    def adjustnf(self):
+        self.comboBox_nf.clear()
+        lst_nf = self.get_data_from_sqlites("clmaster", "select dyear from qkb where lyid = '" + str(self.comboBox_dq.currentData()) + "' GROUP BY dyear")
+        self.comboBox_nf.addItems(np.unique(lst_nf[:, 0]).tolist())
+        self.comboBox_nf.setdefaulttext()
+
+    # 添加数据库名称到表格中返回表格
+    def search_data_from_first(self):
+        keyword = self.lineEdit_keyword.text()
+        keyword = keyword.replace(' ', '%')
+        nf = self.comboBox_nf.currentText()
+        sql = self.creat_nf_sql(nf)
+        dq = str(self.comboBox_dq.currentData())
+        if sql != "all":
+            lst_qkb = self.get_data_from_sqlites("clmaster", "select id from qkb WHERE lyid = '" + dq + "' and" + sql)
+        else:
+            lst_qkb = np.array([])
+        if int(lst_qkb.shape[0]) != 0:
+            self.clbs = np.zeros((0, 10))
+            for i in range(int(lst_qkb.shape[0])):
+                if lst_qkb[i, 0] in self.alldatas:
+                    if self.get_type_of_table(lst_qkb[i, 0]):
+                        sql = "select clmc,clgg,cldw,csj,zgcsj,hsj,zghsj,lxid,dqdm,qkid from cljgb where clmc like '%" + keyword + "%' or clgg like '%" + keyword + "%'"
+                    else:
+                        sql = "select clmc,clgg,cldw,csj,zgcsj,hsj,zghsj,lbid,dqdm,qkid from cljgb where clmc like '%" + keyword + "%' or clgg like '%" + keyword + "%'"
+                    qkb_name = lst_qkb[i, 0]
+                    if self.radio_N10.isChecked():
+                        qkb_name = 'MATERINfOPRICEDB\\' + qkb_name
+                    clb = self.get_data_from_sqlites(qkb_name, sql)
+                    # 名称，规格，单位，除税价，含税价，价格类型，地区代码，期刊名称
+                    if clb.size > 0:
+                        self.clbs = np.concatenate((self.clbs, clb), axis=0)
+            # 期刊表格号
+            for i, code in enumerate(self.clbs[:, 9]):
+                decode_index = np.where(self.qkdatas[:, 0] == code)[0]
+                if decode_index.size > 0:
+                    self.clbs[i, 9] = self.qkdatas[decode_index, 1][0]
+                else:
+                    self.clbs[i, 9] = 'unknow'
+            # 地区
+            for i, code in enumerate(self.clbs[:, 8]):
+                decode_index = np.where((self.dqlsts[:, 1] == code) & (self.dqlsts[:, 0] == dq))[0]
+                if decode_index.size > 0:
+                    self.clbs[i, 8] = self.dqlsts[decode_index, 2][0]
+                else:
+                    self.clbs[i, 8] = 'unknow'
+            # 材料类别
+            for i, code in enumerate(self.clbs[:, 7]):
+                decode_index = np.where(self.cllbs[:, 0] == code)[0]
+                if decode_index.size > 0:
+                    self.clbs[i, 7] = self.cllbs[decode_index, 1][0]
+                else:
+                    self.clbs[i, 7] = '信息价'
+            self.result_to_table(self.tableWidget_xxj, self.clbs)
+            # 加载结果数据到下拉选择框中
+            self.comboBox_qsxx.clear()
+            self.comboBox_qsxx.addItems(np.unique(self.clbs[:, 9]).tolist())
+            self.comboBox_qsxx.setCurrentIndex(-1)
+            self.comboBox_dqxx.clear()
+            self.comboBox_dqxx.addItems(np.unique(self.clbs[:, 8]).tolist())
+            self.comboBox_dqxx.setCurrentIndex(-1)
+        else:
+            self.mbox = QMessageBox(self)
+            self.mbox.information(self, '提示', '当前查询无对应期刊表，请切换关键字或年份！')
+
+    # 还没有调整数据的显示样式，等后面再说
+    @staticmethod
+    def result_to_table(table: QTableWidget, lst: numpy.ndarray):
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        for i in range(int(lst.shape[0])):
+            table.insertRow(table.rowCount())
+            inx = table.rowCount() - 1
+            table.setItem(inx, 0, QtWidgets.QTableWidgetItem(lst[i, 0]))
+            table.setItem(inx, 1, QtWidgets.QTableWidgetItem(lst[i, 1]))
+            table.setItem(inx, 2, QtWidgets.QTableWidgetItem(lst[i, 2]))
+            table.setItem(inx, 5, QtWidgets.QTableWidgetItem(lst[i, 7]))
+            table.setItem(inx, 6, QtWidgets.QTableWidgetItem(lst[i, 8]))
+            table.setItem(inx, 7, QtWidgets.QTableWidgetItem(lst[i, 9]))
+
+            if float(lst[i, 4]) == 0:
+                item = QtWidgets.QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, float(lst[i, 3]))
+                table.setItem(inx, 3, item)
+            else:
+                table.setItem(inx, 3, QtWidgets.QTableWidgetItem(str(float(lst[i, 3])) + '-' + str(float(lst[i, 4]))))
+
+            if float(lst[i, 6]) == 0:
+                item = QtWidgets.QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, float(lst[i, 5]))
+                table.setItem(inx, 4, item)
+            else:
+                table.setItem(inx, 4, QtWidgets.QTableWidgetItem(str(float(lst[i, 5])) + '-' + str(float(lst[i, 6]))))
+
+            table.item(inx, 2).setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            table.item(inx, 3).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            table.item(inx, 4).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        table.resizeRowsToContents()
+        table.setItemDelegate(QtWidgets.QItemDelegate())
+        table.setSortingEnabled(True)
+
+    # 二次筛选
+    def find_two_result(self):
+        result = self.clbs
+        self.tableWidget_xxj.setSortingEnabled(False)
+        try:
+            if self.lineEdit_5.text() != '':
+                mask = np.array([self.lineEdit_5.text() in x for x in result[:, 0]])
+                result = result[mask]
+            if self.lineEdit_1.text() != '':
+                mask = np.array([self.lineEdit_1.text() in x for x in result[:, 1]])
+                result = result[mask]
+            if self.lineEdit_7.text() != '':
+                mask = np.array([self.lineEdit_7.text() in x for x in result[:, 2]])
+                result = result[mask]
+            if self.comboBox_dqxx.currentText() != '':
+                lists = self.comboBox_dqxx.currentText().split(';')
+                mask = np.array([any(item in x for item in lists) for x in result[:, 8]])
+                result = result[mask]
+            if self.comboBox_qsxx.currentText() != '':
+                lists = self.comboBox_qsxx.currentText().split(';')
+                mask = np.array([any(item in x for item in lists) for x in result[:, 9]])
+                result = result[mask]
+            if self.lineEdit_8.text() != '':
+                mask = np.array([self.lineEdit_8.text() in x for x in result[:, 7]])
+                result = result[mask]
+        except IndexError:
+            result = np.array([])
+        self.result_to_table(self.tableWidget_xxj, result)
+        self.tableWidget_xxj.setSortingEnabled(True)
+
+    @staticmethod
+    def check_text_in_list(text, text_list):
+        return any(text in item for item in text_list)
+
+    # 最重要的一步，检查数据库地址
+    def checkaddress(self):
+        if self.materil_address is None or not os.path.exists(self.materil_address + "/clmaster.db3"):
+            self.mbox = QMessageBox(self)
+            self.mbox.information(self,'提示','未设置数据库位置，请切换到设置页面，选择数据库地址')
+
+    # 检查数据库是否齐全
+    def check_datas_integrity(self):
+        self.qkdatas = self.get_data_from_sqlites("clmaster", "select id,mc from qkb")
+        self.finddataFile()
+        self.listWidget_2.clear()
+        for i in range(self.qkdatas.shape[0]):
+            if self.qkdatas[i, 0] not in self.alldatas:
+                if self.qkdatas[i, 1].find('自贡') < 0:
+                    item = QtWidgets.QListWidgetItem()
+                    item.setText(self.qkdatas[i, 1])
+                    item.setSizeHint(QSize(self.listWidget_2.width(), 28))
+                    self.listWidget_2.addItem(item)
+        self.label_25.setText('未下载的期数：' + str(self.listWidget_2.count()))
+        self.select_datas_add()
+
+    # 查询数据类型
+    def get_type_of_table(self, sqlitename: str):
+        file = self.materil_address + "/" + sqlitename + ".db3"
+        if os.path.exists(file):
+            conn = sqlite3.connect(file)
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT * FROM pragma_table_info(?) WHERE name=?", ('cljgb', 'lxid'))
+                return cur.fetchall()
+            except sqlite3.Error as e:
+                pass
+            # 关闭游标
+            cur.close()
+            # 关闭数据库连接
+            conn.close()
+        else:
+            return False
+
+    # 数据库读取信息
+    def get_data_from_sqlites(self, sqlitename: str, sql: str):
+        file = self.materil_address + "/" + sqlitename + ".db3"
+        if os.path.exists(file):
+            conn = sqlite3.connect(file)
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                return np.array(cur.fetchall())
+            except sqlite3.Error as e:
+                pass
+            # 关闭游标
+            cur.close()
+            # 关闭数据库连接
+            conn.close()
+        else:
+            return np.zeros((0, 10))
+
+    # 全数据库文件检索存表
+    def finddataFile(self):
+        if self.radio_N10.isChecked():
+            materil_address = self.materil_address + "/MATERINfOPRICEDB"
+        else:
+            materil_address = self.materil_address
+        try:
+            for fileName in os.listdir(materil_address):
+                if fileName.find("db3") != -1:
+                    self.alldatas.append(fileName.replace(".db3", ""))
+        except FileNotFoundError as e:
+            pass
+
+    # 选择框的数据添加
+    def select_datas_add(self):
+        self.comboBox_dq.blockSignals(True)
+        self.comboBox_dq.clear()
+        lst_dq = self.get_data_from_sqlites("clmaster", "select id,mc from jgly")
+        for i in range(lst_dq.shape[0]):
+            self.comboBox_dq.addItem(lst_dq[i, 1], userData=lst_dq[i, 0])
+        self.comboBox_dq.setCurrentIndex(1)
+        lst_nf = self.get_data_from_sqlites("clmaster", "select dyear from qkb where lyid = '" + str(self.comboBox_dq.currentData()) + "' GROUP BY dyear")
+        self.comboBox_nf.addItems(np.unique(lst_nf[:, 0]).tolist())
+        self.comboBox_nf.setdefaulttext()
+        self.dqlsts = self.get_data_from_sqlites("clmaster", "select lyid,dqid,dqmc from dqb")
+        self.cllbs = self.get_data_from_sqlites("clmaster", "select id,lbmc from cllb")
+        self.comboBox_dq.blockSignals(False)
+
+    # 构造年份多项组合查询语句
+    @staticmethod
+    def creat_nf_sql(nf_text: str):
+        if nf_text != '':
+            nfs = nf_text.split(';')
+            if len(nfs) == 1:
+                return " dyear = '" + nfs[0] + "'"
+            else:
+                sql = ''
+                for nf in nfs:
+                    sql += "dyear = '" + nf + "' or "
+                return " (" + sql[:-4] + ")"
+        else:
+            return "all"
+
+    # 程序重启
+    @staticmethod
+    def restart_program():
+        python = sys.executable
+        script = sys.argv[0]
+        subprocess.Popen([python, script])
+
+        QtWidgets.QApplication.quit()
+
+    # 获取数据库地址
+    def get_data_file(self, lineEdite: QLineEdit):
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, '选择宏业安装文件的DAT目录，<N9选择DAT>,<N10选择DATABASE>', '/')
+        if directory:
+            lineEdite.setText(directory)
+
+    # 信息价查询切换界面初始化
+    def xxjsearch(self, index):
+        if self.mainContent.tabText(index) == '信息价':
+            self.get_xxj_file_from()
+            if not self.comboBox_dq.count() > 0:
+                self.check_datas_integrity()
+
+    # 信息价切换数据库来源
+    def change_data_from(self):
+        self.get_xxj_file_from()
+        self.check_datas_integrity()
+
+    # 确认当前数据库地址
+    def get_xxj_file_from(self):
+        if self.radio_N9.isChecked():
+            self.materil_address = self.N9lineEdite.text()
+            self.statusbar.showMessage("N9数据库")
+        else:
+            self.materil_address = self.N10lineEdite.text()
+            self.statusbar.showMessage("N10数据库")
+        self.checkaddress()
+
+    # 调整窗体比例
+    def change_splitter(self):
+        if self.checkBox_21.isChecked():
+            self.splitter_11.setSizes([0, 1])
+        else:
+            widths = self.width() - self.itemList.width() - 5
+            self.splitter_11.setSizes([int(widths*0.2), int(widths*0.8)])
+
+def custom_excepthook(types, value, traceback):
+    # 在这里实现自定义的错误处理逻辑，这里只是简单地显示一个错误对话框
+    QMessageBox.critical(None, "Error", f"错误代码提示: {str(value)}")
+    sys.__excepthook__(types, value, traceback)
+
+
+def main():
+    sys.excepthook = custom_excepthook
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    form = MainWindow()
+    qdarktheme.setup_theme(form.settings.value('theme', 'auto', str))
+    form.show()
+    if form.settings.value("splitter_2_order", defaultValue=True, type=bool):
+        form.splitter_2.insertWidget(0, form.layoutWidget_2)
+        form.splitter_2.insertWidget(1, form.mainContent)
+    else:
+        form.splitter_2.insertWidget(0, form.mainContent)
+        form.splitter_2.insertWidget(1, form.layoutWidget_2)
+    form.splitter_2.setSizes([int(x) for x in form.settings.value('splitter_2_size', defaultValue=[100, 100], type=list)])
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
